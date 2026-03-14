@@ -149,13 +149,47 @@ format_uptime() {
 # Extract a string value from minimal JSON (no jq)
 json_str() {
     local key="$1" data="$2"
-    printf '%s' "${data}" | grep -oP "\"${key}\"\s*:\s*\"\K[^\"]*" 2>/dev/null || echo ""
+    printf '%s' "${data}" | sed -n 's/.*"'"${key}"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
 
 # Extract a numeric value from minimal JSON
 json_num() {
     local key="$1" data="$2"
-    printf '%s' "${data}" | grep -oP "\"${key}\"\s*:\s*\K[0-9]+" 2>/dev/null || echo "0"
+    printf '%s' "${data}" | sed -n 's/.*"'"${key}"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# Convert MiB to a clean GB string
+# Values > 10 GB: rounded to nearest integer (e.g. "73 GB")
+# Values <= 10 GB: one decimal place (e.g. "3.5 GB")
+mib_to_gb() {
+    local mib="$1"
+    # mib * 100 / 1024 gives centidecimal GB (avoids floating point)
+    local centi_gb=$(( mib * 100 / 1024 ))
+    local whole_gb=$(( centi_gb / 100 ))
+    local frac=$(( centi_gb % 100 ))
+    if [[ ${whole_gb} -gt 10 ]]; then
+        # Round: if fractional part >= 50, round up
+        if [[ ${frac} -ge 50 ]]; then
+            whole_gb=$(( whole_gb + 1 ))
+        fi
+        printf '%s GB' "${whole_gb}"
+    elif [[ ${whole_gb} -eq 10 ]]; then
+        # Exactly at boundary — check if rounding pushes above 10
+        local tenth=$(( (frac + 5) / 10 ))
+        if [[ ${tenth} -ge 10 ]]; then
+            printf '10 GB'
+        else
+            printf '%s.%s GB' "${whole_gb}" "${tenth}"
+        fi
+    else
+        # One decimal place, rounded
+        local tenth=$(( (frac + 5) / 10 ))
+        if [[ ${tenth} -ge 10 ]]; then
+            printf '%s GB' "$(( whole_gb + 1 ))"
+        else
+            printf '%s.%s GB' "${whole_gb}" "${tenth}"
+        fi
+    fi
 }
 
 # Label + value helper for consistent formatting
@@ -266,12 +300,15 @@ render_gpu() {
 
     label_val "GPU" "${GPU_NAME}"
 
-    # VRAM bar
+    # VRAM bar (use raw MiB for accurate percentage)
     local vram_bar
     vram_bar="$(progress_bar "${GPU_MEM_USED}" "${GPU_MEM_TOTAL}" 15)"
-    printf '  %b%-8s%b %b%s / %s MiB%b  %s\n' \
+    local vram_used_gb vram_total_gb
+    vram_used_gb="$(mib_to_gb "${GPU_MEM_USED}")"
+    vram_total_gb="$(mib_to_gb "${GPU_MEM_TOTAL}")"
+    printf '  %b%-8s%b %b%s / %s%b  %s\n' \
         "${BOLD_WHITE}" "VRAM" "${RESET}" \
-        "${CYAN}" "${GPU_MEM_USED}" "${GPU_MEM_TOTAL}" "${RESET}" \
+        "${CYAN}" "${vram_used_gb}" "${vram_total_gb}" "${RESET}" \
         "${vram_bar}"
 
     # Temp color
@@ -307,13 +344,13 @@ fetch_ollama() {
     OLLAMA_MODELS_JSON="${response}"
 
     # Count models: count occurrences of "name" keys in the models array
-    OLLAMA_MODEL_COUNT="$(printf '%s' "${response}" | grep -oP '"name"\s*:\s*"[^"]*"' | wc -l)" || OLLAMA_MODEL_COUNT=0
+    OLLAMA_MODEL_COUNT="$(printf '%s' "${response}" | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | wc -l)" || OLLAMA_MODEL_COUNT=0
 
     # Extract model details: name, size, expires_at
     local names sizes expires
-    mapfile -t names < <(printf '%s' "${response}" | grep -oP '"name"\s*:\s*"\K[^"]*' 2>/dev/null || true)
-    mapfile -t sizes < <(printf '%s' "${response}" | grep -oP '"size"\s*:\s*\K[0-9]+' 2>/dev/null || true)
-    mapfile -t expires < <(printf '%s' "${response}" | grep -oP '"expires_at"\s*:\s*"\K[^"]*' 2>/dev/null || true)
+    mapfile -t names < <(printf '%s' "${response}" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' 2>/dev/null || true)
+    mapfile -t sizes < <(printf '%s' "${response}" | sed -n 's/.*"size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' 2>/dev/null || true)
+    mapfile -t expires < <(printf '%s' "${response}" | sed -n 's/.*"expires_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' 2>/dev/null || true)
 
     OLLAMA_MODELS_DISPLAY=()
     local now_epoch
@@ -422,22 +459,22 @@ find_llama_processes() {
         local vram
         vram="$(get_vram_for_pid "${pid}")"
         if [[ -n "${vram}" ]] && [[ "${vram}" != "0" ]]; then
-            LLAMA_VRAMS+=("${vram} MiB")
+            LLAMA_VRAMS+=("$(mib_to_gb "${vram}")")
         else
             LLAMA_VRAMS+=("-")
         fi
 
         # Model: parse -m or --model from args
         local model=""
-        model="$(echo "${args}" | grep -oP '(-m|--model)\s+\K\S+' | head -1)" || model=""
+        model="$(echo "${args}" | sed -n 's/.*\(-m\|--model\)[[:space:]]\+\(\S\+\).*/\2/p' | head -1)" || model=""
 
         # Parse port from args: --port
         local port=""
-        port="$(echo "${args}" | grep -oP '--port\s+\K[0-9]+' | head -1)" || port=""
+        port="$(echo "${args}" | sed -n 's/.*--port[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || port=""
 
         # If no port from args, try ss
         if [[ -z "${port}" ]]; then
-            port="$(ss -tlnp 2>/dev/null | grep "pid=${pid}[,)]" | grep -oP ':\K[0-9]+(?=\s)' | head -1)" || port=""
+            port="$(ss -tlnp 2>/dev/null | grep "pid=${pid}[,)]" | sed -n 's/.*:\([0-9]\+\)[[:space:]].*/\1/p' | head -1)" || port=""
         fi
 
         # If no model from args, try the API
@@ -445,7 +482,7 @@ find_llama_processes() {
             local api_response
             api_response="$(curl -s --max-time 1 "http://localhost:${port}/v1/models" 2>/dev/null)" || api_response=""
             if [[ -n "${api_response}" ]]; then
-                model="$(printf '%s' "${api_response}" | grep -oP '"id"\s*:\s*"\K[^"]*' | head -1)" || model=""
+                model="$(printf '%s' "${api_response}" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)" || model=""
             fi
         fi
 
@@ -502,9 +539,9 @@ fetch_reaper() {
     if [[ -f "${cron_file}" ]]; then
         REAPER_STATUS="active"
         # Parse interval from */N pattern
-        REAPER_INTERVAL="$(grep -oP '^\*/\K[0-9]+' "${cron_file}" 2>/dev/null | head -1)" || REAPER_INTERVAL=""
+        REAPER_INTERVAL="$(sed -n 's/^\*\/\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_INTERVAL=""
         # Parse --max-idle value
-        REAPER_MAX_IDLE="$(grep -oP '\-\-max-idle\s+\K[0-9]+' "${cron_file}" 2>/dev/null | head -1)" || REAPER_MAX_IDLE=""
+        REAPER_MAX_IDLE="$(sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_MAX_IDLE=""
         return
     fi
 
@@ -513,8 +550,8 @@ fetch_reaper() {
     user_cron="$(crontab -l 2>/dev/null)" || user_cron=""
     if echo "${user_cron}" | grep -q "llama-reaper"; then
         REAPER_STATUS="active"
-        REAPER_INTERVAL="$(echo "${user_cron}" | grep "llama-reaper" | grep -oP '^\*/\K[0-9]+' | head -1)" || REAPER_INTERVAL=""
-        REAPER_MAX_IDLE="$(echo "${user_cron}" | grep "llama-reaper" | grep -oP '\-\-max-idle\s+\K[0-9]+' | head -1)" || REAPER_MAX_IDLE=""
+        REAPER_INTERVAL="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/^\*\/\([0-9]\+\).*/\1/p' | head -1)" || REAPER_INTERVAL=""
+        REAPER_MAX_IDLE="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MAX_IDLE=""
         return
     fi
 
@@ -618,7 +655,7 @@ render_compact() {
 
     local vram_str="N/A"
     if [[ "${GPU_AVAILABLE}" == true ]]; then
-        vram_str="${GPU_MEM_USED}/${GPU_MEM_TOTAL} MiB"
+        vram_str="$(mib_to_gb "${GPU_MEM_USED}") / $(mib_to_gb "${GPU_MEM_TOTAL}")"
     fi
 
     local ollama_str
