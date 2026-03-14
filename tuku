@@ -19,7 +19,7 @@ set -euo pipefail
 # SECTION 1: CONSTANTS & DEFAULTS
 # ============================================================
 
-VERSION="2.0.0"
+VERSION="0.1.0"
 readonly SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_NAME="$(basename "$0")"
 
@@ -947,6 +947,65 @@ render_ollama() {
     fi
 }
 
+# ---------- Reaper status for dashboard ----------
+
+# Determine reaper countdown status for a llama.cpp process.
+# Reads .alive files from BOTH system and user state dirs (read-only).
+# Returns: "status_text|color_var"
+#   - "-"             (dim)    → reaper not installed
+#   - "safe Xm"       (green)  → process younger than min_age
+#   - "active"         (green)  → eligible, .alive recent
+#   - "expires soon"   (red)    → eligible, .alive old
+#   - "monitoring"     (yellow) → eligible, no .alive file
+get_reaper_status_for_pid() {
+    local pid="$1" uptime_seconds="$2"
+
+    # If reaper is not installed, show "-"
+    if [[ "${REAPER_STATUS}" != "active" ]]; then
+        echo "-|dim"
+        return
+    fi
+
+    local min_age="${REAPER_MIN_AGE:-60}"
+    local max_idle="${REAPER_MAX_IDLE:-30}"
+    local process_age_minutes=$(( uptime_seconds / 60 ))
+
+    # Process younger than min_age — safe
+    if [[ ${process_age_minutes} -lt ${min_age} ]]; then
+        local remaining=$(( min_age - process_age_minutes ))
+        echo "safe ${remaining}m|green"
+        return
+    fi
+
+    # Process is eligible — check .alive files
+    local alive_ts=""
+    local system_alive="/var/lib/tuku/reaper/${pid}.alive"
+    local user_alive="${HOME}/.local/state/tuku/reaper/${pid}.alive"
+
+    # Check system mode first, then user mode
+    if [[ -f "${system_alive}" ]]; then
+        alive_ts="$(cat "${system_alive}" 2>/dev/null)" || alive_ts=""
+    fi
+    if [[ -z "${alive_ts}" ]] && [[ -f "${user_alive}" ]]; then
+        alive_ts="$(cat "${user_alive}" 2>/dev/null)" || alive_ts=""
+    fi
+
+    if [[ -n "${alive_ts}" ]] && [[ "${alive_ts}" =~ ^[0-9]+$ ]]; then
+        local now
+        now="$(date +%s)"
+        local idle_seconds=$(( now - alive_ts ))
+        local max_idle_seconds=$(( max_idle * 60 ))
+        if [[ ${idle_seconds} -lt ${max_idle_seconds} ]]; then
+            echo "active|green"
+        else
+            echo "expires soon|red"
+        fi
+    else
+        # No .alive file — reaper hasn't assessed yet
+        echo "monitoring|yellow"
+    fi
+}
+
 # ---------- llama.cpp display ----------
 
 DASH_LLAMA_PIDS=()
@@ -955,6 +1014,8 @@ DASH_LLAMA_VRAMS=()
 DASH_LLAMA_MODELS=()
 DASH_LLAMA_PORTS=()
 DASH_LLAMA_UPTIMES=()
+DASH_LLAMA_STATUSES=()
+DASH_LLAMA_STATUS_COLORS=()
 
 # Dashboard-specific process discovery (uses cached GPU data, API fallbacks)
 find_llama_for_dashboard() {
@@ -1012,6 +1073,14 @@ find_llama_for_dashboard() {
         else
             DASH_LLAMA_UPTIMES+=("-")
         fi
+
+        # Reaper status (read-only — no side effects)
+        local status_result status_text status_color
+        status_result="$(get_reaper_status_for_pid "${pid}" "${uptime_sec}")"
+        status_text="${status_result%%|*}"
+        status_color="${status_result##*|}"
+        DASH_LLAMA_STATUSES+=("${status_text}")
+        DASH_LLAMA_STATUS_COLORS+=("${status_color}")
     done <<< "${ps_output}"
 }
 
@@ -1022,8 +1091,8 @@ render_llama() {
         return
     fi
 
-    printf '  %b%-8s %-8s %-8s %-24s %-7s %s%b\n' \
-        "${BOLD_WHITE}" "PID" "USER" "VRAM" "ENDPOINT" "UPTIME" "MODEL" "${RESET}"
+    printf '  %b%-8s %-8s %-8s %-24s %-7s %-13s %s%b\n' \
+        "${BOLD_WHITE}" "PID" "USER" "VRAM" "ENDPOINT" "UPTIME" "STATUS" "MODEL" "${RESET}"
 
     for i in "${!DASH_LLAMA_PIDS[@]}"; do
         local endpoint="${DASH_LLAMA_PORTS[$i]}"
@@ -1031,12 +1100,22 @@ render_llama() {
             endpoint="http://localhost:${endpoint}/"
         fi
 
-        printf '  %b%-8s%b %b%-8s%b %b%-8s%b %b%-24s%b %b%-7s%b %b%s%b\n' \
+        # Map status color name to ANSI variable
+        local sc=""
+        case "${DASH_LLAMA_STATUS_COLORS[$i]}" in
+            green)  sc="${GREEN}" ;;
+            red)    sc="${RED}" ;;
+            yellow) sc="${YELLOW}" ;;
+            *)      sc="${CYAN}" ;;   # dim/"−" uses default
+        esac
+
+        printf '  %b%-8s%b %b%-8s%b %b%-8s%b %b%-24s%b %b%-7s%b %b%-13s%b %b%s%b\n' \
             "${CYAN}" "${DASH_LLAMA_PIDS[$i]}" "${RESET}" \
             "${CYAN}" "${DASH_LLAMA_USERS[$i]}" "${RESET}" \
             "${CYAN}" "${DASH_LLAMA_VRAMS[$i]}" "${RESET}" \
             "${CYAN}" "${endpoint}" "${RESET}" \
             "${CYAN}" "${DASH_LLAMA_UPTIMES[$i]}" "${RESET}" \
+            "${sc}" "${DASH_LLAMA_STATUSES[$i]}" "${RESET}" \
             "${CYAN}" "${DASH_LLAMA_MODELS[$i]}" "${RESET}"
     done
 }
@@ -1126,9 +1205,10 @@ render_json() {
         for i in "${!DASH_LLAMA_PIDS[@]}"; do
             local comma=","
             [[ $i -eq $(( ${#DASH_LLAMA_PIDS[@]} - 1 )) ]] && comma=""
-            printf '      {"pid": %s, "user": "%s", "vram": "%s", "model": "%s", "port": "%s", "uptime": "%s"}%s\n' \
+            printf '      {"pid": %s, "user": "%s", "vram": "%s", "model": "%s", "port": "%s", "uptime": "%s", "status": "%s"}%s\n' \
                 "${DASH_LLAMA_PIDS[$i]}" "${DASH_LLAMA_USERS[$i]}" "${DASH_LLAMA_VRAMS[$i]}" \
-                "${DASH_LLAMA_MODELS[$i]}" "${DASH_LLAMA_PORTS[$i]}" "${DASH_LLAMA_UPTIMES[$i]}" "${comma}"
+                "${DASH_LLAMA_MODELS[$i]}" "${DASH_LLAMA_PORTS[$i]}" "${DASH_LLAMA_UPTIMES[$i]}" \
+                "${DASH_LLAMA_STATUSES[$i]:-}" "${comma}"
         done
     fi
     printf '    ]\n'
