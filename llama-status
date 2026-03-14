@@ -49,13 +49,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${NO_COLOR}" == true ]]; then
+if [[ "${NO_COLOR}" == true ]] || [[ "${OUTPUT_MODE}" == "json" ]]; then
     BOLD_WHITE=''
     CYAN=''
     GREEN=''
     YELLOW=''
     RED=''
     RESET=''
+fi
+
+# Color-enabled flag (used to gate OSC 8 hyperlinks)
+USE_COLOR=true
+if [[ "${NO_COLOR}" == true ]] || [[ "${OUTPUT_MODE}" == "json" ]]; then
+    USE_COLOR=false
 fi
 
 # ---------- Helpers ----------
@@ -189,6 +195,18 @@ mib_to_gb() {
         else
             printf '%s.%s GB' "${whole_gb}" "${tenth}"
         fi
+    fi
+}
+
+# OSC 8 hyperlink: wrap text in a clickable terminal link
+# Usage: osc8_link URL DISPLAYED_TEXT
+# Only emits escape codes when USE_COLOR is true
+osc8_link() {
+    local url="$1" text="$2"
+    if [[ "${USE_COLOR}" == true ]]; then
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "${url}" "${text}"
+    else
+        printf '%s' "${text}"
     fi
 }
 
@@ -403,8 +421,10 @@ render_ollama() {
     fi
 
     local status_color="${GREEN}"
-    printf '  %b%-8s%b %b● running%b (%s models loaded)\n' \
-        "${BOLD_WHITE}" "Status" "${RESET}" "${status_color}" "${RESET}" "${OLLAMA_MODEL_COUNT}"
+    local ollama_url
+    ollama_url="$(osc8_link "http://localhost:11434" "● running")"
+    printf '  %b%-8s%b %b%s%b (%s models loaded)\n' \
+        "${BOLD_WHITE}" "Status" "${RESET}" "${status_color}" "${ollama_url}" "${RESET}" "${OLLAMA_MODEL_COUNT}"
 
     if [[ ${OLLAMA_MODEL_COUNT} -gt 0 ]] && [[ ${#OLLAMA_MODELS_DISPLAY[@]} -gt 0 ]]; then
         # First model with label
@@ -516,17 +536,23 @@ render_llama() {
     fi
 
     # Table header
-    printf '  %b%-8s %-8s %-11s %-30s %-7s %s%b\n' \
-        "${BOLD_WHITE}" "PID" "USER" "VRAM" "MODEL" "PORT" "UPTIME" "${RESET}"
+    printf '  %b%-8s %-8s %-8s %-7s %-7s %s%b\n' \
+        "${BOLD_WHITE}" "PID" "USER" "VRAM" "PORT" "UPTIME" "MODEL" "${RESET}"
 
     for i in "${!LLAMA_PIDS[@]}"; do
-        printf '  %b%-8s%b %b%-8s%b %b%-11s%b %b%-30s%b %b%-7s%b %b%s%b\n' \
+        # Build port display with OSC 8 hyperlink if applicable
+        local port_display="${LLAMA_PORTS[$i]}"
+        if [[ "${port_display}" != "-" ]]; then
+            port_display="$(osc8_link "http://localhost:${LLAMA_PORTS[$i]}" "${LLAMA_PORTS[$i]}")"
+        fi
+
+        printf '  %b%-8s%b %b%-8s%b %b%-8s%b %b%-7s%b %b%-7s%b %b%s%b\n' \
             "${CYAN}" "${LLAMA_PIDS[$i]}" "${RESET}" \
             "${CYAN}" "${LLAMA_USERS[$i]}" "${RESET}" \
             "${CYAN}" "${LLAMA_VRAMS[$i]}" "${RESET}" \
-            "${CYAN}" "${LLAMA_MODELS[$i]}" "${RESET}" \
-            "${CYAN}" "${LLAMA_PORTS[$i]}" "${RESET}" \
-            "${CYAN}" "${LLAMA_UPTIMES[$i]}" "${RESET}"
+            "${CYAN}" "${port_display}" "${RESET}" \
+            "${CYAN}" "${LLAMA_UPTIMES[$i]}" "${RESET}" \
+            "${CYAN}" "${LLAMA_MODELS[$i]}" "${RESET}"
     done
 }
 
