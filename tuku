@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# llama-reaper — watchdog that detects and kills idle llama.cpp processes
+# tuku — watchdog that detects and kills idle llama.cpp processes
 # Last-ditch safety net for shared GPU servers.
 #
 # Two modes:
 #   User mode (default): manages only current user's processes
 #   System mode (--system): manages ALL users' processes (needs root for install)
 #
-# Usage: llama-reaper [--min-age MINUTES] [--max-idle MINUTES] [--dry-run] [--verbose] [--force]
-#        llama-reaper list
-#        llama-reaper install [--system] [--interval MINUTES]
-#        llama-reaper uninstall [--system]
+# Usage: tuku [--min-age MINUTES] [--max-idle MINUTES] [--dry-run] [--verbose] [--force]
+#        tuku list
+#        tuku install [--system] [--interval MINUTES]
+#        tuku uninstall [--system]
 
 readonly VERSION="1.0.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_PATH="$(readlink -f "$0")"
-USER_STATE_DIR="${HOME}/.local/state/llama-reaper"
+USER_STATE_DIR="${HOME}/.local/state/tuku"
 REAPER_STATE_DIR="${USER_STATE_DIR}/reaper"
 readonly USER_LOG="${USER_STATE_DIR}/reaper.log"
-readonly SYSTEM_LOG="/var/log/llama-reaper.log"
-readonly CRON_MARKER="# llama-reaper-managed"
-readonly SYSTEM_CRON_FILE="/etc/cron.d/llama-reaper"
+readonly SYSTEM_LOG="/var/log/tuku.log"
+readonly CRON_MARKER="# tuku-managed"
+readonly SYSTEM_CRON_FILE="/etc/cron.d/tuku"
 
 # Llama process name patterns (extended regex for grep -E)
 readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama\.cpp'
@@ -41,7 +41,7 @@ SYSTEM_MODE=false
 
 usage() {
     cat <<'EOF'
-Usage: llama-reaper [OPTIONS] [COMMAND]
+Usage: tuku [OPTIONS] [COMMAND]
 
 Watchdog that detects and kills idle llama.cpp processes.
 
@@ -86,27 +86,27 @@ Scoring System:
   Score >= 8 and idle for >= --max-idle minutes: KILL
 
 Examples:
-  llama-reaper                        # Run once in user mode
-  llama-reaper --dry-run --verbose    # See what would happen
-  llama-reaper --min-age 30 --max-idle 15  # Tighter thresholds
-  llama-reaper --force               # Kill idle processes immediately
-  llama-reaper list                   # Show all llama processes
-  llama-reaper install --interval 3   # Cron every 3 minutes (user)
-  llama-reaper install --system       # Cron every 5 minutes (root)
-  llama-reaper uninstall              # Remove user cron entry
+  tuku                        # Run once in user mode
+  tuku --dry-run --verbose    # See what would happen
+  tuku --min-age 30 --max-idle 15  # Tighter thresholds
+  tuku --force               # Kill idle processes immediately
+  tuku list                   # Show all llama processes
+  tuku install --interval 3   # Cron every 3 minutes (user)
+  tuku install --system       # Cron every 5 minutes (root)
+  tuku uninstall              # Remove user cron entry
 EOF
     exit 0
 }
 
 usage_install() {
     cat <<'EOF'
-Usage: llama-reaper install [--system] [--interval MINUTES] [--min-age MINUTES] [--max-idle MINUTES]
+Usage: tuku install [--system] [--interval MINUTES] [--min-age MINUTES] [--max-idle MINUTES]
 
-Install llama-reaper as a recurring cron job.
+Install tuku as a recurring cron job.
 
 Options:
   --system             Install system-wide (requires sudo). Creates
-                       /etc/cron.d/llama-reaper running as root.
+                       /etc/cron.d/tuku running as root.
   --interval MINUTES   How often the reaper runs (default: 5)
   --min-age MINUTES    Minimum process age for reaping eligibility (default: 60).
                        Passed through to the cron entry.
@@ -118,22 +118,22 @@ User mode (default):
   Adds an entry to the current user's crontab.
 
 System mode (--system):
-  Creates /etc/cron.d/llama-reaper that runs as root, managing
+  Creates /etc/cron.d/tuku that runs as root, managing
   ALL users' llama.cpp processes.
 
 Examples:
-  llama-reaper install                              # User cron, defaults
-  llama-reaper install --interval 3 --min-age 30    # Every 3min, 30min age gate
-  llama-reaper install --system --max-idle 15        # System-wide, 15min idle
+  tuku install                              # User cron, defaults
+  tuku install --interval 3 --min-age 30    # Every 3min, 30min age gate
+  tuku install --system --max-idle 15        # System-wide, 15min idle
 EOF
     exit 0
 }
 
 usage_uninstall() {
     cat <<'EOF'
-Usage: llama-reaper uninstall [--system]
+Usage: tuku uninstall [--system]
 
-Remove the llama-reaper cron job.
+Remove the tuku cron job.
 
 Options:
   --system       Remove the system-wide cron entry (requires sudo)
@@ -144,7 +144,7 @@ EOF
 
 usage_list() {
     cat <<'EOF'
-Usage: llama-reaper list
+Usage: tuku list
 
 Show all llama.cpp processes on the system with diagnostic info.
 
@@ -767,7 +767,7 @@ cmd_list() {
     gpu_procs="$(get_gpu_processes)"
 
     # Collect state dirs to check (user dir + system dir for complete picture)
-    local system_state_dir="/var/lib/llama-reaper/reaper"
+    local system_state_dir="/var/lib/tuku/reaper"
     local state_dirs=("${REAPER_STATE_DIR}")
     if [[ "${REAPER_STATE_DIR}" != "${system_state_dir}" ]] && [[ -d "${system_state_dir}" ]]; then
         state_dirs+=("${system_state_dir}")
@@ -906,7 +906,7 @@ install_user() {
     local existing
     existing="$(crontab -l 2>/dev/null || true)"
     if echo "${existing}" | grep -q "${CRON_MARKER}"; then
-        echo "llama-reaper cron entry already exists. Use 'llama-reaper uninstall' first."
+        echo "tuku cron entry already exists. Use 'tuku uninstall' first."
         echo "Current entry:"
         echo "${existing}" | grep "${CRON_MARKER}" -A1
         return 1
@@ -929,7 +929,7 @@ install_user() {
     echo "  ${cron_line}"
     echo ""
     echo "View with: crontab -l"
-    echo "Remove with: llama-reaper uninstall"
+    echo "Remove with: tuku uninstall"
 }
 
 install_system() {
@@ -955,8 +955,8 @@ install_system() {
 
     # Create /etc/cron.d entry
     cat > "${SYSTEM_CRON_FILE}" <<EOF
-# llama-reaper: watchdog for idle llama.cpp processes
-# Installed by: llama-reaper install --system
+# tuku: watchdog for idle llama.cpp processes
+# Installed by: tuku install --system
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 
@@ -968,7 +968,7 @@ EOF
     echo "Installed system cron: ${SYSTEM_CRON_FILE}"
     echo "  Runs every ${interval} minutes as root"
     echo ""
-    echo "Remove with: llama-reaper uninstall --system"
+    echo "Remove with: tuku uninstall --system"
 }
 
 cmd_uninstall() {
@@ -994,14 +994,14 @@ uninstall_user() {
     existing="$(crontab -l 2>/dev/null || true)"
 
     if ! echo "${existing}" | grep -q "${CRON_MARKER}"; then
-        echo "No llama-reaper cron entry found in user crontab."
+        echo "No tuku cron entry found in user crontab."
         return 0
     fi
 
     # Remove lines containing our marker
     echo "${existing}" | grep -v "${CRON_MARKER}" | crontab -
 
-    echo "Removed llama-reaper from user crontab."
+    echo "Removed tuku from user crontab."
 }
 
 uninstall_system() {
@@ -1080,11 +1080,11 @@ main() {
                 usage
                 ;;
             --version)
-                echo "llama-reaper ${VERSION}"
+                echo "tuku ${VERSION}"
                 exit 0
                 ;;
             *)
-                die "Unknown option: $1. Try 'llama-reaper --help'."
+                die "Unknown option: $1. Try 'tuku --help'."
                 ;;
         esac
     done
@@ -1092,8 +1092,8 @@ main() {
     # Override state directories for system mode so cron (running as root)
     # and user diagnostics don't collide on ${HOME}-based paths.
     if [[ "${SYSTEM_MODE}" == true ]]; then
-        USER_STATE_DIR="/var/lib/llama-reaper"
-        REAPER_STATE_DIR="/var/lib/llama-reaper/reaper"
+        USER_STATE_DIR="/var/lib/tuku"
+        REAPER_STATE_DIR="/var/lib/tuku/reaper"
     fi
 
     reap

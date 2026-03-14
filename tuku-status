@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# llama-status — GPU status dashboard
+# tuku-status — GPU status dashboard
 # Neofetch-style display of GPU, Ollama, llama.cpp, and reaper status.
 
 readonly VERSION="2.0.0"
@@ -22,7 +22,7 @@ NO_COLOR=false
 
 usage() {
     cat <<'EOF'
-Usage: llama-status [--json] [--compact] [--no-color] [--help|-h]
+Usage: tuku-status [--json] [--compact] [--no-color] [--help|-h]
 
 GPU status dashboard with Ollama, llama.cpp, and reaper info.
 
@@ -541,7 +541,7 @@ render_llama() {
 REAPER_STATUS="" REAPER_INTERVAL="" REAPER_MIN_AGE="" REAPER_MAX_IDLE=""
 
 fetch_reaper() {
-    local cron_file="/etc/cron.d/llama-reaper"
+    local cron_file="/etc/cron.d/tuku"
     if [[ -f "${cron_file}" ]]; then
         REAPER_STATUS="active"
         # Parse interval from */N pattern
@@ -556,11 +556,11 @@ fetch_reaper() {
     # Check user crontab
     local user_cron
     user_cron="$(crontab -l 2>/dev/null)" || user_cron=""
-    if echo "${user_cron}" | grep -q "llama-reaper"; then
+    if echo "${user_cron}" | grep -q "tuku"; then
         REAPER_STATUS="active"
-        REAPER_INTERVAL="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/^\*\/\([0-9]\+\).*/\1/p' | head -1)" || REAPER_INTERVAL=""
-        REAPER_MIN_AGE="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/.*--min-age[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MIN_AGE=""
-        REAPER_MAX_IDLE="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MAX_IDLE=""
+        REAPER_INTERVAL="$(echo "${user_cron}" | grep "tuku" | sed -n 's/^\*\/\([0-9]\+\).*/\1/p' | head -1)" || REAPER_INTERVAL=""
+        REAPER_MIN_AGE="$(echo "${user_cron}" | grep "tuku" | sed -n 's/.*--min-age[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MIN_AGE=""
+        REAPER_MAX_IDLE="$(echo "${user_cron}" | grep "tuku" | sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MAX_IDLE=""
         return
     fi
 

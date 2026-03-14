@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install.sh — system-wide installer for llama-reaper
+# install.sh — system-wide installer for tuku
 # Copies scripts to /usr/local/bin/ and optionally sets up the system reaper cron.
 
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SCRIPTS=("llama-reaper" "llama-status")
+readonly SCRIPTS=("tuku" "tuku-status")
 readonly INSTALL_DIR="/usr/local/bin"
-readonly STATE_DIR="/var/lib/llama-reaper"
+readonly STATE_DIR="/var/lib/tuku"
 
 # ---------- Colors ----------
 
@@ -29,7 +29,7 @@ usage() {
 Usage: install.sh [OPTIONS]
        install.sh uninstall [--purge]
 
-System-wide installer for llama-reaper.
+System-wide installer for tuku.
 
 Commands:
   (default)       Install scripts to /usr/local/bin/ and create state directories
@@ -40,12 +40,12 @@ Install Options:
   --help, -h      Show this help message
 
 Uninstall Options:
-  --purge         Also remove /var/lib/llama-reaper/ state directory
+  --purge         Also remove /var/lib/tuku/ state directory
 
 What it does:
-  1. Copies llama-reaper, llama-status to /usr/local/bin/
+  1. Copies tuku, tuku-status to /usr/local/bin/
   2. Sets ownership root:root, mode 0755
-  3. Creates /var/lib/llama-reaper/ for system-mode state
+  3. Creates /var/lib/tuku/ for system-mode state
   4. Optionally installs system reaper cron (--with-reaper)
 
 Must be run as root (sudo ./install.sh).
@@ -85,7 +85,7 @@ do_install() {
 
     require_root
 
-    printf "\n${BOLD}Installing llama-reaper...${RESET}\n\n"
+    printf "\n${BOLD}Installing tuku...${RESET}\n\n"
 
     # 1. Copy scripts to /usr/local/bin/
     for script in "${SCRIPTS[@]}"; do
@@ -122,9 +122,9 @@ do_install() {
     if [[ "${with_reaper}" == true ]]; then
         echo ""
         printf "${BOLD}Installing system reaper cron...${RESET}\n"
-        "${INSTALL_DIR}/llama-reaper" install --system --interval 5 --min-age 60 --max-idle 30
+        "${INSTALL_DIR}/tuku" install --system --interval 5 --min-age 60 --max-idle 30
         check "System reaper cron installed (every 5m, min-age 60m, max-idle 30m)"
-        info "Customize with: llama-reaper install --help"
+        info "Customize with: tuku install --help"
     fi
 
     # 5. PATH message
@@ -132,11 +132,11 @@ do_install() {
     check "Installation complete!"
     echo ""
     info "/usr/local/bin is typically already on PATH."
-    info "Verify with: which llama-reaper"
+    info "Verify with: which tuku"
     echo ""
     info "Available commands:"
-    info "  llama-reaper    — Watchdog for idle llama.cpp processes"
-    info "  llama-status    — GPU status dashboard"
+    info "  tuku            — Watchdog for idle llama.cpp processes"
+    info "  tuku-status     — GPU status dashboard"
     echo ""
 }
 
@@ -155,12 +155,12 @@ do_uninstall() {
 
     require_root
 
-    printf "\n${BOLD}Uninstalling llama-reaper...${RESET}\n\n"
+    printf "\n${BOLD}Uninstalling tuku...${RESET}\n\n"
 
     # 1. Remove system cron if it exists
-    if [[ -f /etc/cron.d/llama-reaper ]]; then
-        "${INSTALL_DIR}/llama-reaper" uninstall --system 2>/dev/null \
-            || rm -f /etc/cron.d/llama-reaper
+    if [[ -f /etc/cron.d/tuku ]]; then
+        "${INSTALL_DIR}/tuku" uninstall --system 2>/dev/null \
+            || rm -f /etc/cron.d/tuku
         check "Removed system reaper cron"
     else
         info "No system reaper cron found (skipping)"

@@ -1,4 +1,4 @@
-# llama-reaper
+# tuku
 
 GPU cleanup tools for shared servers running llama.cpp. Automatically detects and kills idle `llama-server` / `llama-cli` processes that are blocking the GPU.
 
@@ -8,15 +8,15 @@ Solves the "someone forgot to stop their llama-server and now nobody else can us
 
 | Tool | Purpose |
 |------|---------|
-| `llama-reaper` | Watchdog that scores idle llama.cpp processes and kills them on a schedule |
-| `llama-status` | GPU dashboard showing everything running on the GPU (llama.cpp + Ollama) |
+| `tuku` | Watchdog that scores idle llama.cpp processes and kills them on a schedule |
+| `tuku-status` | GPU dashboard showing everything running on the GPU (llama.cpp + Ollama) |
 Ollama processes are **never** targeted. Only `llama-server`, `llama-cli`, and `llama-cpp` processes are eligible for reaping.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/cgam-ai-sig/llama-reaper.git
-cd llama-reaper
+git clone https://github.com/cgam-ai-sig/tuku.git
+cd tuku
 sudo ./install.sh --with-reaper
 ```
 
@@ -73,40 +73,40 @@ Worst case: an idle process survives ~90 minutes (60m age gate + 30m idle durati
 
 ```bash
 # System-wide (all users, needs root)
-sudo llama-reaper install --system --interval 5 --min-age 60 --max-idle 30
+sudo tuku install --system --interval 5 --min-age 60 --max-idle 30
 
 # User-only (just your processes)
-llama-reaper install --interval 5 --min-age 60 --max-idle 30
+tuku install --interval 5 --min-age 60 --max-idle 30
 ```
 
-**System mode** creates `/etc/cron.d/llama-reaper` and runs as root, managing all users' processes.
+**System mode** creates `/etc/cron.d/tuku` and runs as root, managing all users' processes.
 
 **User mode** adds an entry to your personal crontab, only managing your own processes.
 
 ### Remove the reaper cron
 
 ```bash
-llama-reaper uninstall           # user cron
-llama-reaper uninstall --system  # system cron
+tuku uninstall           # user cron
+tuku uninstall --system  # system cron
 ```
 
 ### One-off checks
 
 ```bash
-llama-reaper --dry-run --verbose  # see what would happen, don't kill anything
-llama-reaper list                 # show all llama.cpp processes with scores
-llama-reaper --force              # skip --max-idle duration check, kill immediately if score >= 8
+tuku --dry-run --verbose  # see what would happen, don't kill anything
+tuku list                 # show all llama.cpp processes with scores
+tuku --force              # skip --max-idle duration check, kill immediately if score >= 8
 ```
 
-## llama-status
+## tuku-status
 
 GPU dashboard with four output modes:
 
 ```bash
-llama-status              # full color dashboard
-llama-status --compact    # single-line summary
-llama-status --json       # machine-readable JSON
-llama-status --no-color   # no ANSI codes (for piping/logging)
+tuku-status              # full color dashboard
+tuku-status --compact    # single-line summary
+tuku-status --json       # machine-readable JSON
+tuku-status --no-color   # no ANSI codes (for piping/logging)
 ```
 
 Example output (`--no-color`):
@@ -136,7 +136,7 @@ Shows GPU stats, Ollama status with loaded models and TTL, all llama.cpp process
 
 ```bash
 sudo ./install.sh uninstall          # remove tools from /usr/local/bin/
-sudo ./install.sh uninstall --purge  # also remove /var/lib/llama-reaper/ state files
+sudo ./install.sh uninstall --purge  # also remove /var/lib/tuku/ state files
 ```
 
 ## Requirements
