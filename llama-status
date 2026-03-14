@@ -204,7 +204,7 @@ mib_to_gb() {
 osc8_link() {
     local url="$1" text="$2"
     if [[ "${USE_COLOR}" == true ]]; then
-        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "${url}" "${text}"
+        printf '\033]8;;%s\007%s\033]8;;\007' "${url}" "${text}"
     else
         printf '%s' "${text}"
     fi
@@ -422,7 +422,7 @@ render_ollama() {
 
     local status_color="${GREEN}"
     local ollama_url
-    ollama_url="$(osc8_link "http://localhost:11434" "● running")"
+    ollama_url="$(osc8_link "http://localhost:11434/" "● running")"
     printf '  %b%-8s%b %b%s%b (%s models loaded)\n' \
         "${BOLD_WHITE}" "Status" "${RESET}" "${status_color}" "${ollama_url}" "${RESET}" "${OLLAMA_MODEL_COUNT}"
 
@@ -543,7 +543,7 @@ render_llama() {
         # Build port display with OSC 8 hyperlink if applicable
         local port_display="${LLAMA_PORTS[$i]}"
         if [[ "${port_display}" != "-" ]]; then
-            port_display="$(osc8_link "http://localhost:${LLAMA_PORTS[$i]}" "${LLAMA_PORTS[$i]}")"
+            port_display="$(osc8_link "http://localhost:${LLAMA_PORTS[$i]}/" "${LLAMA_PORTS[$i]}")"
         fi
 
         printf '  %b%-8s%b %b%-8s%b %b%-8s%b %b%-7s%b %b%-7s%b %b%s%b\n' \
