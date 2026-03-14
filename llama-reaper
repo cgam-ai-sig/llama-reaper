@@ -8,7 +8,7 @@ set -euo pipefail
 #   User mode (default): manages only current user's processes
 #   System mode (--system): manages ALL users' processes (needs root for install)
 #
-# Usage: llama-reaper [--max-idle MINUTES] [--dry-run] [--verbose] [--force]
+# Usage: llama-reaper [--min-age MINUTES] [--max-idle MINUTES] [--dry-run] [--verbose] [--force]
 #        llama-reaper list
 #        llama-reaper install [--system] [--interval MINUTES]
 #        llama-reaper uninstall [--system]
@@ -26,11 +26,11 @@ readonly SYSTEM_CRON_FILE="/etc/cron.d/llama-reaper"
 # Llama process name patterns (extended regex for grep -E)
 readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama\.cpp'
 
-# Scoring thresholds
-readonly SCORE_WARN=6
+# Scoring threshold — single threshold, kill if idle long enough
 readonly SCORE_KILL=8
 
 # Defaults
+MIN_AGE_MINUTES=60
 MAX_IDLE_MINUTES=30
 DRY_RUN=false
 VERBOSE=false
@@ -51,19 +51,29 @@ Commands:
   uninstall [OPTIONS]      Remove the cron job
 
 Options (main / default command):
-  --max-idle MINUTES       Minimum age (minutes) for a process to be eligible
-                           for reaping (default: 30)
+  --min-age MINUTES        Minimum age (minutes) for a process to be eligible
+                           for reaping. Processes younger than this are ignored
+                           entirely. (default: 60)
+  --max-idle MINUTES       How many continuous minutes a process must score as
+                           idle before it is killed. (default: 30)
   --dry-run                Show what would happen without killing anything
   --verbose                Show detailed idle scoring for each process
-  --force                  Skip two-phase warn-then-kill; kill immediately
-                           if score >= threshold
+  --force                  Skip the --max-idle duration check; kill immediately
+                           if score >= threshold. For "I need the GPU NOW."
   --help, -h               Show this help message
   --version                Show version
 
-Install/Uninstall Options:
-  --system                 System-wide mode (manages all users; needs sudo)
-  --interval MINUTES       How often the reaper runs (default: 5)
-  --max-idle MINUTES       Bake --max-idle into the cron entry (default: 30)
+How It Works:
+  Processes must be at least --min-age minutes old to be eligible. Once
+  eligible, if a process scores as idle (score >= 8) for --max-idle
+  continuous minutes, it is killed.
+
+  Each run, the reaper checks eligible processes:
+    - If the process has activity (score < 8), an .alive timestamp is written.
+    - If the process looks idle (score >= 8) but was recently active (within
+      --max-idle minutes), it is logged as IDLE and skipped.
+    - If the process looks idle and has exceeded --max-idle since last activity,
+      it is killed (SIGTERM → 10s wait → SIGKILL).
 
 Scoring System:
   No GPU memory at all ................ +3
@@ -73,12 +83,13 @@ Scoring System:
   Running > 2 hours ................... +1
   Running > 8 hours ................... +2
 
-  Score >= 6: WARN (write marker, log warning)
-  Score >= 8: KILL (if warned > 5min ago)
+  Score >= 8 and idle for >= --max-idle minutes: KILL
 
 Examples:
   llama-reaper                        # Run once in user mode
   llama-reaper --dry-run --verbose    # See what would happen
+  llama-reaper --min-age 30 --max-idle 15  # Tighter thresholds
+  llama-reaper --force               # Kill idle processes immediately
   llama-reaper list                   # Show all llama processes
   llama-reaper install --interval 3   # Cron every 3 minutes (user)
   llama-reaper install --system       # Cron every 5 minutes (root)
@@ -89,7 +100,7 @@ EOF
 
 usage_install() {
     cat <<'EOF'
-Usage: llama-reaper install [--system] [--interval MINUTES] [--max-idle MINUTES]
+Usage: llama-reaper install [--system] [--interval MINUTES] [--min-age MINUTES] [--max-idle MINUTES]
 
 Install llama-reaper as a recurring cron job.
 
@@ -97,9 +108,10 @@ Options:
   --system             Install system-wide (requires sudo). Creates
                        /etc/cron.d/llama-reaper running as root.
   --interval MINUTES   How often the reaper runs (default: 5)
-  --max-idle MINUTES   Minimum process age for reaping eligibility (default: 30).
-                       Passed through to the cron entry so each invocation
-                       uses the specified value instead of the default.
+  --min-age MINUTES    Minimum process age for reaping eligibility (default: 60).
+                       Passed through to the cron entry.
+  --max-idle MINUTES   Continuous idle duration before killing (default: 30).
+                       Passed through to the cron entry.
   --help, -h           Show this help message
 
 User mode (default):
@@ -108,6 +120,11 @@ User mode (default):
 System mode (--system):
   Creates /etc/cron.d/llama-reaper that runs as root, managing
   ALL users' llama.cpp processes.
+
+Examples:
+  llama-reaper install                              # User cron, defaults
+  llama-reaper install --interval 3 --min-age 30    # Every 3min, 30min age gate
+  llama-reaper install --system --max-idle 15        # System-wide, 15min idle
 EOF
     exit 0
 }
@@ -131,7 +148,7 @@ Usage: llama-reaper list
 
 Show all llama.cpp processes on the system with diagnostic info.
 
-Displays: PID, user, GPU memory, port, uptime, and idle score.
+Displays: PID, user, GPU memory, port, uptime, idle score, and last active time.
 This is read-only — no sudo needed (uses ps and nvidia-smi).
 EOF
     exit 0
@@ -159,8 +176,8 @@ log_msg() {
     mkdir -p "$(dirname "${lf}")"
     echo "${entry}" >> "${lf}" 2>/dev/null || true
 
-    # Print to stderr if verbose or if it's a warning/kill
-    if [[ "${VERBOSE}" == true ]] || [[ "${level}" == "KILL" ]] || [[ "${level}" == "WARN" ]] || [[ "${level}" == "ERROR" ]]; then
+    # Print to stderr if verbose or if it's a kill/idle/error
+    if [[ "${VERBOSE}" == true ]] || [[ "${level}" == "KILL" ]] || [[ "${level}" == "IDLE" ]] || [[ "${level}" == "ERROR" ]]; then
         echo "${entry}" >&2
     fi
 }
@@ -440,6 +457,24 @@ load_cpu_sample() {
     fi
 }
 
+# ---------- Alive Timestamp Management ----------
+
+# Write/update the .alive timestamp for a PID (epoch seconds)
+write_alive_timestamp() {
+    local pid="$1"
+    local alive_file="${REAPER_STATE_DIR}/${pid}.alive"
+    date +%s > "${alive_file}"
+}
+
+# Read the .alive timestamp for a PID. Returns epoch seconds or empty.
+read_alive_timestamp() {
+    local pid="$1"
+    local alive_file="${REAPER_STATE_DIR}/${pid}.alive"
+    if [[ -f "${alive_file}" ]]; then
+        cat "${alive_file}" 2>/dev/null || true
+    fi
+}
+
 # ---------- Idle Scoring ----------
 
 # Calculate idle score for a process.
@@ -549,11 +584,11 @@ calculate_idle_score() {
             reasons+=("uptime $(format_uptime "${age_seconds}") (+0)")
         fi
 
-        # Check --max-idle: process must be older than max-idle minutes to be eligible
-        if [[ ${age_minutes} -lt ${MAX_IDLE_MINUTES} ]]; then
+        # Check --min-age: process must be older than min-age minutes to be eligible
+        if [[ ${age_minutes} -lt ${MIN_AGE_MINUTES} ]]; then
             # Process is too young — zero out the score
             score=0
-            reasons+=("process younger than --max-idle (${MAX_IDLE_MINUTES}m), NOT eligible")
+            reasons+=("process younger than --min-age (${MIN_AGE_MINUTES}m), NOT eligible")
         fi
     fi
 
@@ -563,38 +598,12 @@ calculate_idle_score() {
     echo "${score} ${reason_str}"
 }
 
-# ---------- Warn / Kill Logic ----------
-
-# Write a warning marker for a PID
-write_warn_marker() {
-    local pid="$1"
-    local marker="${REAPER_STATE_DIR}/${pid}.warned"
-    echo "$(date +%s)" > "${marker}"
-}
-
-# Check if a warn marker exists and is older than 5 minutes
-# Returns 0 if exists and old enough, 1 otherwise
-check_warn_marker_aged() {
-    local pid="$1"
-    local marker="${REAPER_STATE_DIR}/${pid}.warned"
-    [[ -f "${marker}" ]] || return 1
-
-    local warned_epoch
-    warned_epoch="$(cat "${marker}" 2>/dev/null)" || return 1
-    local now
-    now="$(date +%s)"
-    local age=$((now - warned_epoch))
-
-    if [[ ${age} -ge 300 ]]; then
-        return 0
-    fi
-    return 1
-}
+# ---------- Kill Logic ----------
 
 # Remove all reaper state files for a PID
 cleanup_pid_files() {
     local pid="$1"
-    rm -f "${REAPER_STATE_DIR}/${pid}.warned" \
+    rm -f "${REAPER_STATE_DIR}/${pid}.alive" \
           "${REAPER_STATE_DIR}/${pid}.cpu" 2>/dev/null || true
 }
 
@@ -643,10 +652,9 @@ reap() {
         return 0
     fi
 
-    # Pre-fetch GPU process info once (avoid repeated nvidia-smi calls)
-    # (Individual calls in get_gpu_mem_for_pid use the cached approach via function)
-
     local found_any=false
+    local now
+    now="$(date +%s)"
 
     while IFS= read -r proc_line; do
         [[ -z "${proc_line}" ]] && continue
@@ -680,49 +688,44 @@ reap() {
         # Decide action based on score
         if [[ ${score} -ge ${SCORE_KILL} ]]; then
             if [[ "${FORCE}" == true ]]; then
-                # Force mode: kill immediately
+                # Force mode: kill immediately, skip max-idle duration check
                 kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
-            elif check_warn_marker_aged "${pid}"; then
-                # Previously warned and marker is old enough — kill
-                kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
-            elif [[ -f "${REAPER_STATE_DIR}/${pid}.warned" ]]; then
-                # Warned but not aged yet — skip
-                if [[ "${VERBOSE}" == true ]]; then
-                    echo "    → Already warned, waiting for grace period"
-                fi
-                log_msg "SKIP" "PID=${pid} user=${user} model=${model} score=${score} reason=[warned, grace period]"
             else
-                # First time seeing this — warn
-                write_warn_marker "${pid}"
-                if [[ "${DRY_RUN}" == true ]]; then
-                    log_msg "WARN(dry)" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
-                    echo "  [DRY-RUN] Would WARN PID ${pid} (${user}, ${model}, score=${score})"
+                # Check .alive timestamp for continuous idle duration
+                local alive_ts
+                alive_ts="$(read_alive_timestamp "${pid}")"
+
+                if [[ -z "${alive_ts}" ]]; then
+                    # First time seeing this process idle — benefit of the doubt
+                    # Create .alive with current timestamp (treat as "just became idle now")
+                    write_alive_timestamp "${pid}"
+                    if [[ "${VERBOSE}" == true ]]; then
+                        echo "    → First idle detection, creating .alive timestamp, skipping"
+                    fi
+                    log_msg "IDLE" "PID=${pid} user=${user} model=${model} score=${score} reason=[first idle detection, benefit of the doubt]"
                 else
-                    log_msg "WARN" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
-                    echo "  WARNING PID ${pid} (${user}, ${model}, score=${score}) — will kill on next run"
-                fi
-            fi
-        elif [[ ${score} -ge ${SCORE_WARN} ]]; then
-            # Warn threshold but not kill threshold
-            if [[ ! -f "${REAPER_STATE_DIR}/${pid}.warned" ]]; then
-                write_warn_marker "${pid}"
-                if [[ "${DRY_RUN}" == true ]]; then
-                    log_msg "WARN(dry)" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
-                    echo "  [DRY-RUN] Would WARN PID ${pid} (${user}, ${model}, score=${score})"
-                else
-                    log_msg "WARN" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
-                    echo "  WARNING PID ${pid} (${user}, ${model}, score=${score})"
-                fi
-            else
-                if [[ "${VERBOSE}" == true ]]; then
-                    echo "    → Already warned (score below kill threshold)"
+                    local idle_since=$((now - alive_ts))
+                    local max_idle_seconds=$((MAX_IDLE_MINUTES * 60))
+
+                    if [[ ${idle_since} -ge ${max_idle_seconds} ]]; then
+                        # Idle for too long — kill
+                        kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
+                    else
+                        # Idle but within max-idle window — skip
+                        local remaining_minutes=$(( (max_idle_seconds - idle_since) / 60 ))
+                        if [[ "${VERBOSE}" == true ]]; then
+                            echo "    → Idle but within --max-idle window (last active $((idle_since / 60))m ago, ${remaining_minutes}m remaining)"
+                        fi
+                        log_msg "IDLE" "PID=${pid} user=${user} model=${model} score=${score} reason=[idle but within max-idle window, last active $((idle_since / 60))m ago]"
+                    fi
                 fi
             fi
         else
-            # Below warn threshold — clean up any stale markers
-            if [[ -f "${REAPER_STATE_DIR}/${pid}.warned" ]]; then
-                rm -f "${REAPER_STATE_DIR}/${pid}.warned"
-                [[ "${VERBOSE}" == true ]] && echo "    → Score dropped, cleared warning marker"
+            # Score below threshold — process has activity
+            # Write/update .alive timestamp (positive evidence of life)
+            if [[ ${score} -gt 0 ]]; then
+                # Only write alive if the process is actually eligible (score > 0 means it passed min-age)
+                write_alive_timestamp "${pid}"
             fi
             log_msg "SKIP" "PID=${pid} user=${user} model=${model} score=${score} reason=[below threshold]"
         fi
@@ -739,7 +742,7 @@ reap() {
 # Remove reaper state files for PIDs that no longer exist
 cleanup_stale_reaper_files() {
     shopt -s nullglob
-    local files=("${REAPER_STATE_DIR}"/*.warned "${REAPER_STATE_DIR}"/*.cpu)
+    local files=("${REAPER_STATE_DIR}"/*.alive "${REAPER_STATE_DIR}"/*.cpu)
     shopt -u nullglob
 
     for f in "${files[@]}"; do
@@ -820,16 +823,22 @@ cmd_list() {
         score_result="$(calculate_idle_score "${pid}" "${user}" "${args}")"
         score="$(echo "${score_result}" | awk '{print $1}')"
 
-        # Check for warn markers in ALL state dirs
-        local warned=""
+        # Check for .alive files in ALL state dirs — show last active time
+        local last_active_str=""
         for sdir in "${state_dirs[@]}"; do
-            if [[ -f "${sdir}/${pid}.warned" ]]; then
-                warned="W"
+            if [[ -f "${sdir}/${pid}.alive" ]]; then
+                local alive_ts
+                alive_ts="$(cat "${sdir}/${pid}.alive" 2>/dev/null)" || continue
+                if [[ -n "${alive_ts}" ]]; then
+                    local ago=$(( now - alive_ts ))
+                    local ago_min=$(( ago / 60 ))
+                    last_active_str="last active ${ago_min}m ago"
+                fi
                 break
             fi
         done
 
-        entries+=("${pid}|${user}|${gpu_mem}|${port}|${uptime_str}|${score}${warned}|${model}")
+        entries+=("${pid}|${user}|${gpu_mem}|${port}|${uptime_str}|${score}|${model}|${last_active_str}")
     done <<< "${ps_output}"
 
     if [[ ${#entries[@]} -eq 0 ]]; then
@@ -838,20 +847,19 @@ cmd_list() {
     fi
 
     # Table header
-    printf '%-8s %-12s %-10s %-7s %-10s %-6s %s\n' \
-        "PID" "USER" "GPU_MEM" "PORT" "UPTIME" "SCORE" "MODEL"
-    printf '%-8s %-12s %-10s %-7s %-10s %-6s %s\n' \
-        "-------" "------------" "----------" "-------" "----------" "------" "-----"
+    printf '%-8s %-12s %-10s %-7s %-10s %-6s %-20s %s\n' \
+        "PID" "USER" "GPU_MEM" "PORT" "UPTIME" "SCORE" "LAST_ACTIVE" "MODEL"
+    printf '%-8s %-12s %-10s %-7s %-10s %-6s %-20s %s\n' \
+        "-------" "------------" "----------" "-------" "----------" "------" "--------------------" "-----"
 
     for entry in "${entries[@]}"; do
-        IFS='|' read -r pid user gpu_mem port uptime score model <<< "${entry}"
-        printf '%-8s %-12s %-10s %-7s %-10s %-6s %s\n' \
-            "${pid}" "${user}" "${gpu_mem}" "${port}" "${uptime}" "${score}" "${model}"
+        IFS='|' read -r pid user gpu_mem port uptime score model last_active <<< "${entry}"
+        printf '%-8s %-12s %-10s %-7s %-10s %-6s %-20s %s\n' \
+            "${pid}" "${user}" "${gpu_mem}" "${port}" "${uptime}" "${score}" "${last_active}" "${model}"
     done
 
     echo ""
     echo "${#entries[@]} llama.cpp process(es) found."
-    echo "(Score suffix: W=warned)"
 }
 
 # ---------- Install / Uninstall Subcommands ----------
@@ -859,6 +867,7 @@ cmd_list() {
 cmd_install() {
     local system=false
     local interval=5
+    local min_age=""
     local max_idle=""
 
     while [[ $# -gt 0 ]]; do
@@ -867,6 +876,10 @@ cmd_install() {
             --interval)
                 [[ -n "${2:-}" ]] || die "--interval requires a value"
                 interval="$2"; shift 2
+                ;;
+            --min-age)
+                [[ -n "${2:-}" ]] || die "--min-age requires a value"
+                min_age="$2"; shift 2
                 ;;
             --max-idle)
                 [[ -n "${2:-}" ]] || die "--max-idle requires a value"
@@ -878,15 +891,16 @@ cmd_install() {
     done
 
     if [[ "${system}" == true ]]; then
-        install_system "${interval}" "${max_idle}"
+        install_system "${interval}" "${min_age}" "${max_idle}"
     else
-        install_user "${interval}" "${max_idle}"
+        install_user "${interval}" "${min_age}" "${max_idle}"
     fi
 }
 
 install_user() {
     local interval="$1"
-    local max_idle="${2:-}"
+    local min_age="${2:-}"
+    local max_idle="${3:-}"
 
     # Check if already installed
     local existing
@@ -898,12 +912,15 @@ install_user() {
         return 1
     fi
 
-    local max_idle_flag=""
+    local extra_flags=""
+    if [[ -n "${min_age}" ]]; then
+        extra_flags+=" --min-age ${min_age}"
+    fi
     if [[ -n "${max_idle}" ]]; then
-        max_idle_flag=" --max-idle ${max_idle}"
+        extra_flags+=" --max-idle ${max_idle}"
     fi
 
-    local cron_line="*/${interval} * * * * ${SCRIPT_PATH}${max_idle_flag} ${CRON_MARKER}"
+    local cron_line="*/${interval} * * * * ${SCRIPT_PATH}${extra_flags} ${CRON_MARKER}"
 
     # Add to crontab
     (echo "${existing}"; echo "${cron_line}") | crontab -
@@ -917,18 +934,23 @@ install_user() {
 
 install_system() {
     local interval="$1"
-    local max_idle="${2:-}"
+    local min_age="${2:-}"
+    local max_idle="${3:-}"
 
     if [[ "$(id -u)" -ne 0 ]]; then
         local extra_args=()
+        [[ -n "${min_age}" ]] && extra_args+=(--min-age "${min_age}")
         [[ -n "${max_idle}" ]] && extra_args+=(--max-idle "${max_idle}")
         echo "System install requires root. Re-running with sudo..."
         exec sudo "${SCRIPT_PATH}" install --system --interval "${interval}" "${extra_args[@]}"
     fi
 
-    local max_idle_flag=""
+    local extra_flags=""
+    if [[ -n "${min_age}" ]]; then
+        extra_flags+=" --min-age ${min_age}"
+    fi
     if [[ -n "${max_idle}" ]]; then
-        max_idle_flag=" --max-idle ${max_idle}"
+        extra_flags+=" --max-idle ${max_idle}"
     fi
 
     # Create /etc/cron.d entry
@@ -938,7 +960,7 @@ install_system() {
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 
-*/${interval} * * * * root ${SCRIPT_PATH} --system-run${max_idle_flag} ${CRON_MARKER}
+*/${interval} * * * * root ${SCRIPT_PATH} --system-run${extra_flags} ${CRON_MARKER}
 EOF
 
     chmod 644 "${SYSTEM_CRON_FILE}"
@@ -1027,6 +1049,11 @@ main() {
     # Parse main options
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --min-age)
+                [[ -n "${2:-}" ]] || die "--min-age requires a value"
+                MIN_AGE_MINUTES="$2"
+                shift 2
+                ;;
             --max-idle)
                 [[ -n "${2:-}" ]] || die "--max-idle requires a value"
                 MAX_IDLE_MINUTES="$2"

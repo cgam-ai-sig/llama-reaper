@@ -538,7 +538,7 @@ render_llama() {
 
 # ---------- Section 4: Reaper ----------
 
-REAPER_STATUS="" REAPER_INTERVAL="" REAPER_MAX_IDLE=""
+REAPER_STATUS="" REAPER_INTERVAL="" REAPER_MIN_AGE="" REAPER_MAX_IDLE=""
 
 fetch_reaper() {
     local cron_file="/etc/cron.d/llama-reaper"
@@ -546,6 +546,8 @@ fetch_reaper() {
         REAPER_STATUS="active"
         # Parse interval from */N pattern
         REAPER_INTERVAL="$(sed -n 's/^\*\/\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_INTERVAL=""
+        # Parse --min-age value
+        REAPER_MIN_AGE="$(sed -n 's/.*--min-age[[:space:]]\+\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_MIN_AGE=""
         # Parse --max-idle value
         REAPER_MAX_IDLE="$(sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_MAX_IDLE=""
         return
@@ -557,6 +559,7 @@ fetch_reaper() {
     if echo "${user_cron}" | grep -q "llama-reaper"; then
         REAPER_STATUS="active"
         REAPER_INTERVAL="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/^\*\/\([0-9]\+\).*/\1/p' | head -1)" || REAPER_INTERVAL=""
+        REAPER_MIN_AGE="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/.*--min-age[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MIN_AGE=""
         REAPER_MAX_IDLE="$(echo "${user_cron}" | grep "llama-reaper" | sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MAX_IDLE=""
         return
     fi
@@ -568,15 +571,10 @@ render_reaper() {
     print_header "Reaper"
     if [[ "${REAPER_STATUS}" == "active" ]]; then
         local detail=""
-        if [[ -n "${REAPER_INTERVAL}" ]] || [[ -n "${REAPER_MAX_IDLE}" ]]; then
-            detail=" ("
-            [[ -n "${REAPER_INTERVAL}" ]] && detail+="every ${REAPER_INTERVAL}m"
-            if [[ -n "${REAPER_MAX_IDLE}" ]]; then
-                [[ -n "${REAPER_INTERVAL}" ]] && detail+=", "
-                detail+="max-idle ${REAPER_MAX_IDLE}m"
-            fi
-            detail+=")"
-        fi
+        local interval="${REAPER_INTERVAL:-5}"
+        local min_age="${REAPER_MIN_AGE:-60}"
+        local max_idle="${REAPER_MAX_IDLE:-30}"
+        detail=" (every ${interval}m, min-age ${min_age}m, max-idle ${max_idle}m)"
         printf '  %b%-8s%b %b● active%s%b\n' \
             "${BOLD_WHITE}" "Status" "${RESET}" "${GREEN}" "${detail}" "${RESET}"
     else
@@ -642,8 +640,9 @@ render_json() {
     printf '  "reaper": {\n'
     printf '    "status": "%s"' "${REAPER_STATUS}"
     if [[ "${REAPER_STATUS}" == "active" ]]; then
-        printf ',\n    "interval_minutes": "%s"' "${REAPER_INTERVAL:-unknown}"
-        printf ',\n    "max_idle_minutes": "%s"' "${REAPER_MAX_IDLE:-unknown}"
+        printf ',\n    "interval_minutes": "%s"' "${REAPER_INTERVAL:-5}"
+        printf ',\n    "min_age_minutes": "%s"' "${REAPER_MIN_AGE:-60}"
+        printf ',\n    "max_idle_minutes": "%s"' "${REAPER_MAX_IDLE:-30}"
     fi
     printf '\n  }\n'
 

@@ -20,7 +20,7 @@ cd llama-reaper
 sudo ./install.sh --with-reaper
 ```
 
-This installs the tools to `/usr/local/bin/` and sets up the system-wide reaper (checks every 15 min, kills processes idle for 30+ min).
+This installs the tools to `/usr/local/bin/` and sets up the system-wide reaper (checks every 5 min, ignores processes younger than 1 hour, kills after 30 min of continuous idleness).
 
 If you just want the tools without the automated reaper:
 
@@ -41,36 +41,31 @@ Each run, the reaper scores every llama.cpp process on several idle signals:
 | Running > 2 hours | +1 | Age bonus |
 | Running > 8 hours | +2 | Larger age bonus (replaces the +1) |
 
-**Score >= 6** → WARN: a marker file is written, the process is logged as idle.
+**Score >= 6** → process is considered idle. The reaper records a `.alive` timestamp tracking the last time the process showed activity.
 
-**Score >= 8** → KILL candidate. But not immediately — the reaper uses a two-phase approach:
+**Score >= 8** → KILL candidate. The reaper checks how long the process has been continuously idle (based on the `.alive` timestamp). If it's been idle for longer than `--max-idle` minutes, the process is killed (SIGTERM, then SIGKILL after 10s if needed).
 
-1. **First run at score >= 8**: writes a warning marker with a timestamp. Process keeps running.
-2. **Next run (5+ minutes later)**: if the marker is still there and the score is still >= 8, the process is killed (SIGTERM, then SIGKILL after 10s if needed).
+If the score drops below 6 between runs (e.g., someone connects), the `.alive` timestamp is reset. The idle clock starts over.
 
-If the score drops below 6 between runs (e.g., someone connects), the warning marker is cleared. The process gets a second chance.
+### The `--min-age` age gate
 
-### The `--max-idle` age gate
+`--min-age` (default: 60 minutes) is an **age gate**. Processes younger than `--min-age` minutes are completely ignored, regardless of their idle score. This prevents the reaper from killing a server that was just started and hasn't received its first request yet.
 
-`--max-idle` (default: 30 minutes) is **not** an idle duration — it's an **age gate**. Processes younger than `--max-idle` minutes are completely ignored, regardless of their idle score. This prevents the reaper from killing a server that was just started and hasn't received its first request yet.
+### The `--max-idle` idle duration
+
+`--max-idle` (default: 30 minutes) is the **continuous idle duration** before a process is killed. The reaper tracks each process's last activity via `.alive` timestamp files. Once a process has been continuously idle (score >= 8) for `--max-idle` minutes, it gets killed.
 
 ### Timeline example
 
-With the default `--interval 15 --max-idle 30`:
+With the default `--interval 5 --min-age 60 --max-idle 30`:
 
 1. **t=0**: User starts `llama-server`, walks away.
-2. **t=15**: Reaper runs. Process is 15 minutes old — younger than `--max-idle` (30m). **Skipped.**
-3. **t=30**: Reaper runs. Process is 30 minutes old — now eligible. Scores high. **WARN marker written.**
-4. **t=45**: Reaper runs. Marker is 15 minutes old (> 5 min grace). Score still high. **KILLED.**
+2. **t=5–55**: Reaper runs every 5 min. Process is younger than `--min-age` (60m). **Skipped.**
+3. **t=60**: Reaper runs. Process is 60 minutes old — now eligible. Scores high. `.alive` timestamp set to now (first idle detection).
+4. **t=65–85**: Reaper keeps running. Score stays high. Idle duration accumulates.
+5. **t=90**: Reaper runs. Process has been continuously idle for 30 min (>= `--max-idle`). **KILLED.**
 
-Worst case: an idle process survives ~45 minutes.
-
-With a tighter `--interval 5 --max-idle 30`:
-
-1. **t=30**: First eligible check. **WARN.**
-2. **t=35**: Grace period passed. **KILLED.**
-
-Worst case: ~35 minutes.
+Worst case: an idle process survives ~90 minutes (60m age gate + 30m idle duration).
 
 ## Configuration
 
@@ -78,10 +73,10 @@ Worst case: ~35 minutes.
 
 ```bash
 # System-wide (all users, needs root)
-llama-reaper install --system --interval 15 --max-idle 30
+sudo llama-reaper install --system --interval 5 --min-age 60 --max-idle 30
 
 # User-only (just your processes)
-llama-reaper install --interval 5 --max-idle 20
+llama-reaper install --interval 5 --min-age 60 --max-idle 30
 ```
 
 **System mode** creates `/etc/cron.d/llama-reaper` and runs as root, managing all users' processes.
@@ -100,7 +95,7 @@ llama-reaper uninstall --system  # system cron
 ```bash
 llama-reaper --dry-run --verbose  # see what would happen, don't kill anything
 llama-reaper list                 # show all llama.cpp processes with scores
-llama-reaper --force              # skip grace period, kill immediately if score >= 8
+llama-reaper --force              # skip --max-idle duration check, kill immediately if score >= 8
 ```
 
 ## llama-status
@@ -132,7 +127,7 @@ Example output (`--no-color`):
   191207   bob      5120 MiB    mistral-7b-v0.3.Q5_K_M.gguf   9090    45m
 
 ━━━ Reaper ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Status   ● active (every 15m, max-idle 30m)
+  Status   ● active (every 5m, min-age 60m, max-idle 30m)
 ```
 
 Shows GPU stats, Ollama status with loaded models and TTL, all llama.cpp processes with user/PID/VRAM/model/port/uptime, and whether the reaper is installed.
