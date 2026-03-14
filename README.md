@@ -6,10 +6,17 @@ Solves the "someone forgot to stop their llama-server and now nobody else can us
 
 ## What's included
 
-| Tool | Purpose |
-|------|---------|
-| `tuku` | Watchdog that scores idle llama.cpp processes and kills them on a schedule |
-| `tuku-status` | GPU dashboard showing everything running on the GPU (llama.cpp + Ollama) |
+`tuku` is a single merged binary — GPU dashboard, idle process reaper, and management CLI.
+
+| Command | Purpose |
+|---------|---------|
+| `tuku` | GPU dashboard showing everything running on the GPU (llama.cpp + Ollama) |
+| `tuku reap` | Run idle process detection and cleanup |
+| `tuku list` | Show all llama.cpp processes with diagnostic info |
+| `tuku kill <PID>` | Manually kill a llama.cpp process |
+| `tuku install` | Set up automatic reaping via cron |
+| `tuku uninstall` | Remove the cron job |
+
 Ollama processes are **never** targeted. Only `llama-server`, `llama-cli`, and `llama-cpp` processes are eligible for reaping.
 
 ## Quick start
@@ -20,7 +27,7 @@ cd tuku
 sudo ./install.sh --with-reaper
 ```
 
-This installs the tools to `/usr/local/bin/` and sets up the system-wide reaper (checks every 5 min, ignores processes younger than 1 hour, kills after 30 min of continuous idleness).
+This installs the tools to `/usr/local/bin/` and sets up the system-wide reaper (checks every 1 min, ignores processes younger than 1 hour, kills after 30 min of continuous idleness).
 
 If you just want the tools without the automated reaper:
 
@@ -41,11 +48,11 @@ Each run, the reaper scores every llama.cpp process on several idle signals:
 | Running > 2 hours | +1 | Age bonus |
 | Running > 8 hours | +2 | Larger age bonus (replaces the +1) |
 
-**Score >= 6** → process is considered idle. The reaper records a `.alive` timestamp tracking the last time the process showed activity.
+GPU power draw is also checked as a safety signal: if GPU power exceeds 100W, compute-related signals score +0 (the GPU is actively working), regardless of per-process utilization readings.
 
 **Score >= 8** → KILL candidate. The reaper checks how long the process has been continuously idle (based on the `.alive` timestamp). If it's been idle for longer than `--max-idle` minutes, the process is killed (SIGTERM, then SIGKILL after 10s if needed).
 
-If the score drops below 6 between runs (e.g., someone connects), the `.alive` timestamp is reset. The idle clock starts over.
+If the score drops below 8 between runs (e.g., someone connects), the `.alive` timestamp is reset. The idle clock starts over.
 
 ### The `--min-age` age gate
 
@@ -57,15 +64,15 @@ If the score drops below 6 between runs (e.g., someone connects), the `.alive` t
 
 ### Timeline example
 
-With the default `--interval 5 --min-age 60 --max-idle 30`:
+With the default `--interval 1 --min-age 60 --max-idle 30`:
 
 1. **t=0**: User starts `llama-server`, walks away.
-2. **t=5–55**: Reaper runs every 5 min. Process is younger than `--min-age` (60m). **Skipped.**
+2. **t=1–59**: Reaper runs every 1 min. Process is younger than `--min-age` (60m). **Skipped.**
 3. **t=60**: Reaper runs. Process is 60 minutes old — now eligible. Scores high. `.alive` timestamp set to now (first idle detection).
-4. **t=65–85**: Reaper keeps running. Score stays high. Idle duration accumulates.
+4. **t=61–89**: Reaper keeps running. Score stays high. Idle duration accumulates.
 5. **t=90**: Reaper runs. Process has been continuously idle for 30 min (>= `--max-idle`). **KILLED.**
 
-Worst case: an idle process survives ~90 minutes (60m age gate + 30m idle duration).
+Worst case: an idle process survives ~91 minutes (60m age gate + 30m idle duration + 1m interval).
 
 ## Configuration
 
@@ -73,10 +80,10 @@ Worst case: an idle process survives ~90 minutes (60m age gate + 30m idle durati
 
 ```bash
 # System-wide (all users, needs root)
-sudo tuku install --system --interval 5 --min-age 60 --max-idle 30
+sudo tuku install --system --interval 1 --min-age 60 --max-idle 30
 
 # User-only (just your processes)
-tuku install --interval 5 --min-age 60 --max-idle 30
+tuku install --interval 1 --min-age 60 --max-idle 30
 ```
 
 **System mode** creates `/etc/cron.d/tuku` and runs as root, managing all users' processes.
@@ -93,20 +100,20 @@ tuku uninstall --system  # system cron
 ### One-off checks
 
 ```bash
-tuku --dry-run --verbose  # see what would happen, don't kill anything
-tuku list                 # show all llama.cpp processes with scores
-tuku --force              # skip --max-idle duration check, kill immediately if score >= 8
+tuku reap --dry-run --verbose  # see what would happen, don't kill anything
+tuku list                      # show all llama.cpp processes with scores
+tuku reap --force              # skip --max-idle duration check, kill immediately if score >= 8
 ```
 
-## tuku-status
+## Dashboard
 
-GPU dashboard with four output modes:
+Run `tuku` with no arguments for the GPU dashboard:
 
 ```bash
-tuku-status              # full color dashboard
-tuku-status --compact    # single-line summary
-tuku-status --json       # machine-readable JSON
-tuku-status --no-color   # no ANSI codes (for piping/logging)
+tuku                     # full color dashboard
+tuku --compact           # single-line summary
+tuku --json              # machine-readable JSON
+tuku --no-color          # no ANSI codes (for piping/logging)
 ```
 
 Example output (`--no-color`):
@@ -114,7 +121,7 @@ Example output (`--no-color`):
 ```
 ━━━ GPU ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   GPU      NVIDIA GeForce RTX 4090
-  VRAM     14227 / 24564 MiB  ━━━━━━━━━───── 57%
+  VRAM     14 GB / 24 GB  ━━━━━━━━━───── 57%
   Temp     52°C    Power   138W / 450W    Util  12%
 
 ━━━ Ollama ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -122,15 +129,15 @@ Example output (`--no-color`):
   Active   llama3.1:8b (5 GB, until 4m)
 
 ━━━ llama.cpp ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  PID      USER     VRAM        MODEL                          PORT    UPTIME
-  185334   alice    8413 MiB    Qwen2.5-Coder-32B-Q4_K_M.gguf 8080    2h 14m
-  191207   bob      5120 MiB    mistral-7b-v0.3.Q5_K_M.gguf   9090    45m
+  PID      USER     VRAM     ENDPOINT                 UPTIME  STATUS        MODEL
+  185334   alice    8 GB     http://localhost:8080/    2h 14m  ● idle 12m    Qwen2.5-Coder-32B-Q4_K_M.gguf
+  191207   bob      5 GB     http://localhost:9090/    45m     ● protected   mistral-7b-v0.3.Q5_K_M.gguf
 
 ━━━ Reaper ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Status   ● active (every 5m, min-age 60m, max-idle 30m)
+  Status   ● active (every 1m, min-age 60m, max-idle 30m)
 ```
 
-Shows GPU stats, Ollama status with loaded models and TTL, all llama.cpp processes with user/PID/VRAM/model/port/uptime, and whether the reaper is installed.
+Shows GPU stats, Ollama status with loaded models and TTL, all llama.cpp processes with user/PID/VRAM/endpoint/uptime/reaper status/model, and whether the reaper is installed.
 
 ## Uninstall
 
