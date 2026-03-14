@@ -10,8 +10,6 @@ Solves the "someone forgot to stop their llama-server and now nobody else can us
 |------|---------|
 | `llama-reaper` | Watchdog that scores idle llama.cpp processes and kills them on a schedule |
 | `llama-status` | GPU dashboard showing everything running on the GPU (llama.cpp + Ollama) |
-| `llama-serve` | Optional wrapper for `llama-server` with auto-shutdown after inactivity |
-
 Ollama processes are **never** targeted. Only `llama-server`, `llama-cli`, and `llama-cpp` processes are eligible for reaping.
 
 ## Quick start
@@ -22,7 +20,7 @@ cd llama-reaper
 sudo ./install.sh --with-reaper
 ```
 
-This installs all three tools to `/usr/local/bin/` and sets up the system-wide reaper (checks every 15 min, kills processes idle for 30+ min).
+This installs the tools to `/usr/local/bin/` and sets up the system-wide reaper (checks every 15 min, kills processes idle for 30+ min).
 
 If you just want the tools without the automated reaper:
 
@@ -138,17 +136,6 @@ Example output (`--no-color`):
 ```
 
 Shows GPU stats, Ollama status with loaded models and TTL, all llama.cpp processes with user/PID/VRAM/model/port/uptime, and whether the reaper is installed.
-
-## llama-serve (optional)
-
-Wraps `llama-server` with per-session auto-shutdown. The server stops itself after a configurable period of inactivity (no active requests, no connections).
-
-```bash
-llama-serve --timeout 30 -- -m model.gguf -c 4096 -ngl 99
-llama-serve --timeout 15 --port 9090 -- -m model.gguf --port 9090
-```
-
-Not needed if you're running the reaper — but useful if you want immediate, per-session control without waiting for the reaper's schedule.
 
 ## Uninstall
 

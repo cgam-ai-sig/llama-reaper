@@ -5,7 +5,7 @@ set -euo pipefail
 # Copies scripts to /usr/local/bin/ and optionally sets up the system reaper cron.
 
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SCRIPTS=("llama-reaper" "llama-status" "llama-serve")
+readonly SCRIPTS=("llama-reaper" "llama-status")
 readonly INSTALL_DIR="/usr/local/bin"
 readonly STATE_DIR="/var/lib/llama-reaper"
 
@@ -43,7 +43,7 @@ Uninstall Options:
   --purge         Also remove /var/lib/llama-reaper/ state directory
 
 What it does:
-  1. Copies llama-reaper, llama-status, llama-serve to /usr/local/bin/
+  1. Copies llama-reaper, llama-status to /usr/local/bin/
   2. Sets ownership root:root, mode 0755
   3. Creates /var/lib/llama-reaper/ for system-mode state
   4. Optionally installs system reaper cron (--with-reaper)
@@ -137,7 +137,6 @@ do_install() {
     info "Available commands:"
     info "  llama-reaper    — Watchdog for idle llama.cpp processes"
     info "  llama-status    — GPU status dashboard"
-    info "  llama-serve     — Wrapper with auto-shutdown"
     echo ""
 }
 

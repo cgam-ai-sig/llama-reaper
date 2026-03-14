@@ -453,7 +453,7 @@ load_cpu_sample() {
 
 # ---------- State File Timeout Check ----------
 
-# Check if the llama-serve state file indicates the process should have timed out
+# Check if a state file indicates the process should have timed out
 # Returns 0 (true) if expired, 1 (false) otherwise
 check_state_file_expired() {
     local pid="$1"
