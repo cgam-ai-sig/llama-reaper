@@ -427,38 +427,22 @@ calculate_idle_score() {
     local now
     now="$(date +%s)"
 
-    # Get overall GPU power draw
-    local gpu_power
-    gpu_power=$(get_gpu_power_draw)
-    local gpu_power_active=false
-    if [[ "${gpu_power}" -gt 100 ]]; then
-        gpu_power_active=true
-    fi
-
-    # --- a. GPU compute activity ---
+    # --- a. GPU compute activity (per-process via pmon) ---
     local gpu_mem
     gpu_mem="$(get_gpu_mem_for_pid "${pid}")"
     if [[ -z "${gpu_mem}" ]] || [[ "${gpu_mem}" == "0" ]]; then
-        if [[ "${gpu_power_active}" == true ]]; then
-            reasons+=("no GPU memory, but power ${gpu_power}W > 100W — GPU active (+0)")
-        else
-            score=$((score + 3))
-            reasons+=("no GPU memory, power ${gpu_power}W (+3)")
-        fi
+        score=$((score + 3))
+        reasons+=("no GPU memory (+3)")
     else
-        if [[ "${gpu_power_active}" == true ]]; then
-            reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W > 100W — GPU active (+0)")
+        local gpu_util_status
+        gpu_util_status="$(get_gpu_utilization_for_pid "${pid}")"
+        if [[ "${gpu_util_status}" == "active" ]]; then
+            reasons+=("GPU mem: ${gpu_mem}MiB, actively computing (+0)")
+        elif [[ "${gpu_util_status}" == "idle" ]]; then
+            score=$((score + 3))
+            reasons+=("GPU mem: ${gpu_mem}MiB, utilization 0% — holding memory idle (+3)")
         else
-            local gpu_util_status
-            gpu_util_status="$(get_gpu_utilization_for_pid "${pid}")"
-            if [[ "${gpu_util_status}" == "active" ]]; then
-                reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W, actively computing (+0)")
-            elif [[ "${gpu_util_status}" == "idle" ]]; then
-                score=$((score + 3))
-                reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W, utilization 0% — holding memory idle (+3)")
-            else
-                reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W, utilization unknown (+0)")
-            fi
+            reasons+=("GPU mem: ${gpu_mem}MiB, utilization unknown (+0)")
         fi
     fi
 
@@ -617,13 +601,11 @@ Options:
 
 Scoring System:
   No GPU memory at all ................ +3
-  GPU memory held, power <= 100W,
-    utilization 0% .................... +3
+  GPU memory held, utilization 0% .... +3
   No CPU time change since last run ... +3
   No network connections (servers) .... +2
   Running > 2 hours ................... +1
   Running > 8 hours ................... +2
-  GPU power > 100W .................... all GPU idle scoring blocked
 
   Score >= 8 and idle for >= --max-idle minutes: KILL
 
@@ -701,9 +683,7 @@ cmd_reap() {
         reason="$(echo "${score_result}" | cut -d' ' -f2-)"
 
         if [[ "${VERBOSE}" == true ]]; then
-            local gpu_power_display
-            gpu_power_display=$(get_gpu_power_draw)
-            echo "  PID ${pid} (${user}, ${model}): score=${score}  [GPU power: ${gpu_power_display}W]"
+            echo "  PID ${pid} (${user}, ${model}): score=${score}"
             echo "    ${reason}"
         fi
 
@@ -861,7 +841,6 @@ get_vram_for_pid() {
 
 GPU_NAME="" GPU_MEM_USED=0 GPU_MEM_TOTAL=0 GPU_TEMP=0
 GPU_POWER_DRAW=0 GPU_POWER_LIMIT=0 GPU_UTIL=0
-GPU_POWER_ACTIVE=false
 
 parse_gpu_info() {
     [[ "${GPU_AVAILABLE}" != true ]] && return 1
@@ -873,11 +852,6 @@ parse_gpu_info() {
     GPU_POWER_DRAW="$(echo "${_pow_draw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -d. -f1)"
     GPU_POWER_LIMIT="$(echo "${_pow_limit}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -d. -f1)"
     GPU_UTIL="$(echo "${_util}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -d. -f1)"
-    if [[ ${GPU_POWER_DRAW} -gt 100 ]]; then
-        GPU_POWER_ACTIVE=true
-    else
-        GPU_POWER_ACTIVE=false
-    fi
     return 0
 }
 
@@ -999,14 +973,14 @@ render_ollama() {
 
 # ---------- Reaper status for dashboard ----------
 
-# Determine reaper countdown status for a llama.cpp process.
+# Determine reaper status for a llama.cpp process.
 # Reads .alive files from BOTH system and user state dirs (read-only).
 # Returns: "status_text|color_var"
 #   - "-"             (dim)    → reaper not installed
-#   - "safe Xm"       (green)  → process younger than min_age
-#   - "active"         (green)  → eligible, .alive recent
-#   - "expires soon"   (red)    → eligible, .alive old
-#   - "monitoring"     (yellow) → eligible, no .alive file
+#   - "fresh"         (green)  → process younger than min_age
+#   - "active"        (yellow) → eligible, .alive recent (within 2 min)
+#   - "inactive"      (green)  → eligible, .alive older than 2 min but idle < max_idle
+#   - "stale Xm"      (red)   → eligible, approaching or past max_idle (X = min remaining)
 get_reaper_status_for_pid() {
     local pid="$1" uptime_seconds="$2"
 
@@ -1020,16 +994,9 @@ get_reaper_status_for_pid() {
     local max_idle="${REAPER_MAX_IDLE:-30}"
     local process_age_minutes=$(( uptime_seconds / 60 ))
 
-    # Process younger than min_age — safe
+    # Process younger than min_age — fresh
     if [[ ${process_age_minutes} -lt ${min_age} ]]; then
-        local remaining=$(( min_age - process_age_minutes ))
-        echo "safe ${remaining}m|green"
-        return
-    fi
-
-    # If GPU power > 100W, treat as active regardless
-    if [[ "${GPU_POWER_ACTIVE}" == true ]]; then
-        echo "active|green"
+        echo "fresh|green"
         return
     fi
 
@@ -1046,19 +1013,32 @@ get_reaper_status_for_pid() {
         alive_ts="$(cat "${user_alive}" 2>/dev/null)" || alive_ts=""
     fi
 
-    if [[ -n "${alive_ts}" ]] && [[ "${alive_ts}" =~ ^[0-9]+$ ]]; then
-        local now
-        now="$(date +%s)"
-        local idle_seconds=$(( now - alive_ts ))
-        local max_idle_seconds=$(( max_idle * 60 ))
-        if [[ ${idle_seconds} -lt ${max_idle_seconds} ]]; then
-            echo "active|green"
-        else
-            echo "expires soon|red"
-        fi
+    # No .alive file or unreadable — reaper hasn't assessed yet, benefit of doubt
+    if [[ -z "${alive_ts}" ]] || ! [[ "${alive_ts}" =~ ^[0-9]+$ ]]; then
+        echo "inactive|green"
+        return
+    fi
+
+    local now
+    now="$(date +%s)"
+    local idle_seconds=$(( now - alive_ts ))
+
+    # Active within last 2 minutes
+    if [[ ${idle_seconds} -lt 120 ]]; then
+        echo "active|yellow"
+        return
+    fi
+
+    # Process has been idle for a while — check remaining time until kill
+    local idle_minutes=$(( idle_seconds / 60 ))
+    local remaining=$(( max_idle - idle_minutes ))
+
+    if [[ ${remaining} -gt 5 ]]; then
+        echo "inactive|green"
+    elif [[ ${remaining} -gt 0 ]]; then
+        echo "stale ${remaining}m|red"
     else
-        # No .alive file — reaper hasn't assessed yet
-        echo "monitoring|yellow"
+        echo "stale 0m|red"
     fi
 }
 
@@ -1163,7 +1143,8 @@ render_llama() {
             green)  sc="${GREEN}" ;;
             red)    sc="${RED}" ;;
             yellow) sc="${YELLOW}" ;;
-            *)      sc="${CYAN}" ;;   # dim/"−" uses default
+            dim)    sc="${DIM_GRAY}" ;;
+            *)      sc="${CYAN}" ;;
         esac
 
         printf '  %b%-8s%b %b%-8s%b %b%-8s%b %b%-24s%b %b%-7s%b %b%-13s%b %b%s%b\n' \
