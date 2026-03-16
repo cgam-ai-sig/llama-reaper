@@ -606,6 +606,7 @@ Options:
   --max-idle MINUTES  Continuous idle time before killing (default: 30)
   --dry-run           Show what would happen without killing
   --verbose           Show detailed idle scoring for each process
+  --json              Output results as JSON
   --force             Skip --max-idle duration check; kill immediately if idle
   --system            Manage ALL users' processes (for system cron)
   --help, -h          Show this help message
@@ -626,11 +627,16 @@ Examples:
   tuku reap --min-age 30 --max-idle 15  # Tighter thresholds
   tuku reap --force                   # Kill idle processes immediately
   tuku reap --system                  # System mode (all users)
+  tuku reap --json                    # Machine-readable JSON output
+  tuku reap --dry-run --json          # Preview reap actions as JSON
 EOF
     exit 0
 }
 
 cmd_reap() {
+    local output_mode="default"
+    local reap_results=()
+
     # Parse reap-specific args
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -642,6 +648,7 @@ cmd_reap() {
                 MAX_IDLE_MINUTES="$2"; shift 2 ;;
             --dry-run)   DRY_RUN=true; shift ;;
             --verbose)   VERBOSE=true; shift ;;
+            --json)      output_mode="json"; shift ;;
             --force)     FORCE=true; shift ;;
             --system)    SYSTEM_MODE=true; shift ;;
             --help|-h)   usage_reap ;;
@@ -661,7 +668,12 @@ cmd_reap() {
     processes="$(find_llama_processes)"
 
     if [[ -z "${processes}" ]]; then
-        [[ "${VERBOSE}" == true ]] && echo "No llama.cpp processes found."
+        if [[ "${output_mode}" == "json" ]]; then
+            printf '{"dry_run": %s, "score_threshold": %s, "min_age_minutes": %s, "max_idle_minutes": %s, "process_count": 0, "processes": []}\n' \
+                "${DRY_RUN}" "${SCORE_KILL}" "${MIN_AGE_MINUTES}" "${MAX_IDLE_MINUTES}"
+        else
+            [[ "${VERBOSE}" == true ]] && echo "No llama.cpp processes found."
+        fi
         return 0
     fi
 
@@ -693,36 +705,56 @@ cmd_reap() {
         score="$(echo "${score_result}" | awk '{print $1}')"
         reason="$(echo "${score_result}" | cut -d' ' -f2-)"
 
-        if [[ "${VERBOSE}" == true ]]; then
+        if [[ "${VERBOSE}" == true ]] && [[ "${output_mode}" != "json" ]]; then
             echo "  PID ${pid} (${user}, ${model}): score=${score}"
             echo "    ${reason}"
         fi
 
         if [[ ${score} -ge ${SCORE_KILL} ]]; then
             if [[ "${FORCE}" == true ]]; then
-                kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
+                if [[ "${output_mode}" == "json" ]]; then
+                    kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}" > /dev/null
+                else
+                    kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
+                fi
+                if [[ "${DRY_RUN}" == true ]]; then
+                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|would_kill|forced")
+                else
+                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|killed|forced")
+                fi
             else
                 local alive_ts
                 alive_ts="$(read_alive_timestamp "${pid}")"
 
                 if [[ -z "${alive_ts}" ]]; then
                     write_alive_timestamp "${pid}"
-                    if [[ "${VERBOSE}" == true ]]; then
+                    if [[ "${VERBOSE}" == true ]] && [[ "${output_mode}" != "json" ]]; then
                         echo "    → First idle detection, creating .alive timestamp, skipping"
                     fi
                     log_msg "IDLE" "PID=${pid} user=${user} model=${model} score=${score} reason=[first idle detection, benefit of the doubt]"
+                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|first_idle|")
                 else
                     local idle_since=$((now - alive_ts))
                     local max_idle_seconds=$((MAX_IDLE_MINUTES * 60))
 
                     if [[ ${idle_since} -ge ${max_idle_seconds} ]]; then
-                        kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
+                        if [[ "${output_mode}" == "json" ]]; then
+                            kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}" > /dev/null
+                        else
+                            kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
+                        fi
+                        if [[ "${DRY_RUN}" == true ]]; then
+                            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|would_kill|idle $((idle_since / 60))m")
+                        else
+                            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|killed|idle $((idle_since / 60))m")
+                        fi
                     else
                         local remaining_minutes=$(( (max_idle_seconds - idle_since) / 60 ))
-                        if [[ "${VERBOSE}" == true ]]; then
+                        if [[ "${VERBOSE}" == true ]] && [[ "${output_mode}" != "json" ]]; then
                             echo "    → Idle but within --max-idle window (last active $((idle_since / 60))m ago, ${remaining_minutes}m remaining)"
                         fi
                         log_msg "IDLE" "PID=${pid} user=${user} model=${model} score=${score} reason=[idle but within max-idle window, last active $((idle_since / 60))m ago]"
+                        reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|idle_waiting|idle $((idle_since / 60))m, ${remaining_minutes}m remaining")
                     fi
                 fi
             fi
@@ -731,8 +763,15 @@ cmd_reap() {
                 write_alive_timestamp "${pid}"
             fi
             log_msg "SKIP" "PID=${pid} user=${user} model=${model} score=${score} reason=[below threshold]"
+            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|skipped|score below threshold")
         fi
     done <<< "${processes}"
+
+    if [[ "${output_mode}" == "json" ]]; then
+        render_reap_json reap_results
+        cleanup_stale_reaper_files
+        return 0
+    fi
 
     if [[ "${found_any}" == false ]]; then
         [[ "${VERBOSE}" == true ]] && echo "No llama.cpp processes found."
@@ -1396,6 +1435,41 @@ render_list_json() {
     printf '}\n'
 }
 
+render_reap_json() {
+    local -n _results=$1
+
+    printf '{\n'
+    printf '  "dry_run": %s,\n' "${DRY_RUN}"
+    printf '  "score_threshold": %s,\n' "${SCORE_KILL}"
+    printf '  "min_age_minutes": %s,\n' "${MIN_AGE_MINUTES}"
+    printf '  "max_idle_minutes": %s,\n' "${MAX_IDLE_MINUTES}"
+    printf '  "process_count": %s,\n' "${#_results[@]}"
+    printf '  "processes": [\n'
+
+    if [[ ${#_results[@]} -gt 0 ]]; then
+        for i in "${!_results[@]}"; do
+            local comma=","
+            [[ $i -eq $(( ${#_results[@]} - 1 )) ]] && comma=""
+
+            IFS='|' read -r pid user model port score reason action detail <<< "${_results[$i]}"
+
+            printf '    {"pid": %s, "user": "%s", "model": "%s", "port": "%s", "score": %s, "reasons": "%s", "action": "%s", "detail": "%s"}%s\n' \
+                "${pid}" \
+                "$(json_escape "${user}")" \
+                "$(json_escape "${model}")" \
+                "$(json_escape "${port}")" \
+                "${score}" \
+                "$(json_escape "${reason}")" \
+                "$(json_escape "${action}")" \
+                "$(json_escape "${detail}")" \
+                "${comma}"
+        done
+    fi
+
+    printf '  ]\n'
+    printf '}\n'
+}
+
 cmd_list() {
     local output_mode="default"
     while [[ $# -gt 0 ]]; do
@@ -1846,6 +1920,9 @@ Dashboard Options:
   --json       Output as JSON
   --compact    Single-line summary
   --no-color   Strip ANSI colors
+
+Reap Options:
+  --json       Output as JSON
 
 List Options:
   --json       Output as JSON

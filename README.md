@@ -101,6 +101,8 @@ tuku uninstall --system  # system cron
 
 ```bash
 tuku reap --dry-run --verbose  # see what would happen, don't kill anything
+tuku reap --json               # machine-readable JSON output of reap results
+tuku reap --dry-run --json     # preview reap actions as JSON
 tuku list                      # show all llama.cpp processes with scores
 tuku list --json               # machine-readable JSON output
 tuku reap --force              # skip --max-idle duration check, kill immediately if score >= 8
