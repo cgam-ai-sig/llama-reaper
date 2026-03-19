@@ -1989,16 +1989,23 @@ cmd_gpu() {
 
 usage_kill() {
     cat <<'EOF'
-Usage: tuku kill <PID> [PID...]
+Usage: tuku kill [OPTIONS] <PID> [PID...]
 
-Manually kill one or more llama.cpp processes.
+Manually kill one or more GPU processes.
 
-Validates that each PID is a llama.cpp process before killing.
+Verifies that each PID is actually using the GPU before killing.
 Uses SIGTERM first, waits 10 seconds, then SIGKILL if needed.
 
+Ollama processes are protected by default. Use --force to override.
+
+Options:
+  --force, -f  Force kill even Ollama processes (bypasses protection)
+  --help, -h   Show this help
+
 Examples:
-  tuku kill 12345              # Kill a single process
-  tuku kill 12345 67890        # Kill multiple processes
+  tuku kill 12345              # Kill a single GPU process
+  tuku kill 12345 67890        # Kill multiple GPU processes
+  tuku kill --force 12345      # Force kill (even if Ollama)
 EOF
     exit 0
 }
@@ -2008,17 +2015,28 @@ cmd_kill() {
         die "tuku kill requires at least one PID. Run 'tuku kill --help'."
     fi
 
-    # Check for --help
+    local force_kill=false
+    local pids=()
+
+    # Parse args: separate flags from PIDs
     for arg in "$@"; do
-        [[ "${arg}" == "--help" || "${arg}" == "-h" ]] && usage_kill
+        case "${arg}" in
+            --help|-h)   usage_kill ;;
+            --force|-f)  force_kill=true ;;
+            *)           pids+=("${arg}") ;;
+        esac
     done
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        die "tuku kill requires at least one PID. Run 'tuku kill --help'."
+    fi
 
     ensure_dirs
 
     local any_killed=false
     local skipped=0
 
-    for target_pid in "$@"; do
+    for target_pid in "${pids[@]}"; do
         # Validate PID is numeric
         if ! [[ "${target_pid}" =~ ^[0-9]+$ ]]; then
             echo "  ERROR: '${target_pid}' is not a valid PID (skipping)"
@@ -2044,17 +2062,31 @@ cmd_kill() {
         exe_path="$(echo "${proc_args}" | awk '{print $1}')"
         exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
 
-        # Explicit Ollama protection — refuse to kill Ollama processes
+        # Ollama protection — refuse unless --force
         if is_ollama_process "${exe_basename}"; then
-            echo "  ${YELLOW}PROTECTED${RESET}: PID ${target_pid} (${exe_basename}) is an Ollama process managed by systemd."
-            echo "  Use 'systemctl stop ollama' to stop the Ollama server."
-            skipped=$((skipped + 1))
-            continue
+            if [[ "${force_kill}" == true ]]; then
+                echo "  ${YELLOW}WARNING${RESET}: Force-killing Ollama process PID ${target_pid}."
+            else
+                echo "  ${YELLOW}PROTECTED${RESET}: PID ${target_pid} (${exe_basename}) is an Ollama process managed by systemd."
+                echo "  Use 'tuku kill --force ${target_pid}' to kill anyway."
+                skipped=$((skipped + 1))
+                continue
+            fi
         fi
 
-        # Verify it matches LLAMA_PATTERN (basename check)
-        if ! echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"; then
-            echo "  ERROR: PID ${target_pid} (${exe_basename}) is not a llama.cpp process (skipping)"
+        # Verify the process is actually using the GPU
+        local is_gpu_process=false
+        local gpu_procs_check
+        gpu_procs_check="$(get_gpu_processes)"
+        if [[ -n "${gpu_procs_check}" ]]; then
+            if echo "${gpu_procs_check}" | awk '{print $1}' | grep -q "^${target_pid}$"; then
+                is_gpu_process=true
+            fi
+        fi
+
+        if [[ "${is_gpu_process}" == false ]]; then
+            echo "  ${YELLOW}SKIP${RESET}: PID ${target_pid} (${exe_basename}) is not using the GPU (skipping)."
+            skipped=$((skipped + 1))
             continue
         fi
 
