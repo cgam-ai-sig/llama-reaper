@@ -13,7 +13,8 @@ Solves the "someone forgot to stop their llama-server and now nobody else can us
 | `tuku` | GPU dashboard showing everything running on the GPU (llama.cpp + Ollama) |
 | `tuku reap` | Run idle process detection and cleanup |
 | `tuku list` | Show all llama.cpp processes with diagnostic info |
-| `tuku kill <PID>` | Manually kill a llama.cpp process |
+| `tuku kill <PID>` | Manually kill a GPU process |
+| `tuku gpu` | Show all processes currently using the GPU |
 | `tuku install` | Set up automatic reaping via cron |
 | `tuku uninstall` | Remove the cron job |
 
@@ -106,6 +107,8 @@ tuku reap --dry-run --json     # preview reap actions as JSON
 tuku list                      # show all llama.cpp processes with scores
 tuku list --json               # machine-readable JSON output
 tuku reap --force              # skip --max-idle duration check, kill immediately if score >= 8
+tuku gpu                       # show all GPU processes
+tuku gpu --json                # machine-readable JSON output of all GPU processes
 ```
 
 ## Dashboard

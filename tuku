@@ -1824,7 +1824,167 @@ cmd_uninstall() {
 }
 
 # ============================================================
-# SECTION 7: KILL COMMAND
+# SECTION 7: GPU COMMAND
+# ============================================================
+
+usage_gpu() {
+    cat <<'EOF'
+Usage: tuku gpu [OPTIONS]
+
+Show all processes currently using the GPU.
+
+Options:
+  --json       Output as JSON
+  --help, -h   Show this help
+
+Examples:
+  tuku gpu                      # show all GPU processes
+  tuku gpu --json               # machine-readable JSON output
+  tuku gpu --json | jq '.processes[] | select(.type == "other")'
+EOF
+    exit 0
+}
+
+render_gpu_json() {
+    local -n arr=$1
+    local count=${#arr[@]}
+    printf '{\n'
+    printf '  "process_count": %d,\n' "${count}"
+    printf '  "processes": ['
+
+    if [[ ${count} -eq 0 ]]; then
+        printf ']\n}\n'
+        return
+    fi
+
+    printf '\n'
+    local i=0
+    local entry
+    for entry in "${arr[@]}"; do
+        IFS='|' read -r e_pid e_user e_type e_mem e_cmd e_uptime <<< "${entry}"
+        printf '    {\n'
+        printf '      "pid": %s,\n' "${e_pid}"
+        printf '      "user": "%s",\n' "$(json_escape "${e_user}")"
+        printf '      "type": "%s",\n' "$(json_escape "${e_type}")"
+        printf '      "gpu_mem": "%s",\n' "$(json_escape "${e_mem}")"
+        printf '      "command": "%s",\n' "$(json_escape "${e_cmd}")"
+        printf '      "uptime": "%s"\n' "$(json_escape "${e_uptime}")"
+        printf '    }'
+        i=$((i + 1))
+        [[ ${i} -lt ${count} ]] && printf ','
+        printf '\n'
+    done
+    printf '  ]\n'
+    printf '}\n'
+}
+
+cmd_gpu() {
+    local output_mode="default"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    output_mode="json"; shift ;;
+            --help|-h) usage_gpu ;;
+            *)         die "Unknown gpu option: $1. Run 'tuku gpu --help'." ;;
+        esac
+    done
+
+    # Get ALL GPU-using PIDs from nvidia-smi
+    local gpu_procs
+    gpu_procs="$(get_gpu_processes)"
+
+    if [[ -z "${gpu_procs}" ]]; then
+        if [[ "${output_mode}" == "json" ]]; then
+            printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
+            return 0
+        fi
+        echo "No GPU processes found."
+        return 0
+    fi
+
+    local entries=()
+    while IFS= read -r gpu_line; do
+        [[ -z "${gpu_line}" ]] && continue
+        local pid gpu_mem
+        pid="$(echo "${gpu_line}" | awk '{print $1}')"
+        gpu_mem="$(echo "${gpu_line}" | awk '{print $2}')"
+
+        # Skip if process no longer exists
+        kill -0 "${pid}" 2>/dev/null || continue
+
+        # Get process metadata from ps
+        local ps_info
+        ps_info="$(ps -p "${pid}" -o user=,etimes=,args= 2>/dev/null)" || continue
+        [[ -z "${ps_info}" ]] && continue
+
+        local user elapsed_secs cmdline
+        user="$(echo "${ps_info}" | awk '{print $1}')"
+        elapsed_secs="$(echo "${ps_info}" | awk '{print $2}')"
+        cmdline="$(echo "${ps_info}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+
+        # Classify process type
+        local exe_basename
+        exe_basename="$(echo "${cmdline}" | awk '{n=split($1,a,"/"); print a[n]}')"
+        local proc_type
+        proc_type="$(classify_gpu_process "${exe_basename}")"
+
+        # Format uptime
+        local uptime_str="-"
+        if [[ ${elapsed_secs} -gt 0 ]]; then
+            uptime_str="$(format_uptime "${elapsed_secs}")"
+        fi
+
+        # Format GPU memory
+        local gpu_mem_str="${gpu_mem} MiB"
+
+        # Truncate command for display
+        local cmd_display="${cmdline}"
+        if [[ ${#cmd_display} -gt 50 ]]; then
+            cmd_display="${cmd_display:0:47}..."
+        fi
+
+        entries+=("${pid}|${user}|${proc_type}|${gpu_mem_str}|${cmd_display}|${uptime_str}")
+    done <<< "${gpu_procs}"
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        if [[ "${output_mode}" == "json" ]]; then
+            printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
+            return 0
+        fi
+        echo "No GPU processes found."
+        return 0
+    fi
+
+    # Output
+    if [[ "${output_mode}" == "json" ]]; then
+        render_gpu_json entries
+        return 0
+    fi
+
+    # Text table
+    printf '\n'
+    printf "  ${BOLD_WHITE}%-8s %-12s %-8s %-12s %-52s %s${RESET}\n" \
+        "PID" "USER" "TYPE" "GPU_MEM" "COMMAND" "UPTIME"
+    printf "  %-8s %-12s %-8s %-12s %-52s %s\n" \
+        "───" "────" "────" "───────" "───────" "──────"
+
+    local entry
+    for entry in "${entries[@]}"; do
+        IFS='|' read -r e_pid e_user e_type e_mem e_cmd e_uptime <<< "${entry}"
+        # Color type labels
+        local type_colored="${e_type}"
+        case "${e_type}" in
+            ollama) type_colored="${CYAN}ollama${RESET}" ;;
+            llama)  type_colored="${GREEN}llama${RESET}" ;;
+            other)  type_colored="${YELLOW}other${RESET}" ;;
+        esac
+        printf "  %-8s %-12s %-8b %-12s %-52s %s\n" \
+            "${e_pid}" "${e_user}" "${type_colored}" "${e_mem}" "${e_cmd}" "${e_uptime}"
+    done
+    printf "\n  %d GPU process(es) found.\n" "${#entries[@]}"
+}
+
+# ============================================================
+# SECTION 8: KILL COMMAND
 # ============================================================
 
 usage_kill() {
@@ -1955,7 +2115,8 @@ Commands:
   list         Show all llama.cpp processes with diagnostic info
   install      Set up automatic reaping via cron
   uninstall    Remove the cron job
-  kill <PID>   Manually kill a llama.cpp process
+  kill <PID>   Manually kill a GPU process
+  gpu            Show all processes using the GPU
 
 Dashboard Options:
   --json       Output as JSON
@@ -1980,6 +2141,7 @@ main() {
         install)   shift; cmd_install "$@" ;;
         uninstall) shift; cmd_uninstall "$@" ;;
         kill)      shift; cmd_kill "$@" ;;
+        gpu)       shift; cmd_gpu "$@" ;;
         --help|-h) usage ;;
         --version) echo "tuku ${VERSION}"; exit 0 ;;
         --json|--compact|--no-color)
