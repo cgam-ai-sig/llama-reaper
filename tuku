@@ -33,6 +33,7 @@ readonly SYSTEM_CRON_FILE="/etc/cron.d/tuku"
 
 # Llama process name patterns (extended regex for grep -E)
 readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama[.]cpp'
+readonly OLLAMA_PATTERN='ollama'                    # Ollama — protected from reap/kill
 
 # Safety net: common non-llama executables to skip
 readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
@@ -151,11 +152,13 @@ discover_llama_processes() {
     fi
 
     local filtered
-    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
+    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" -v ollama="${OLLAMA_PATTERN}" '
 {
     cmd = $3
     n = split(cmd, parts, "/")
     exe = parts[n]
+    # Never match Ollama processes (explicit protection)
+    if (match(exe, ollama)) next
     if (match(exe, excluded)) next
     if (match(exe, pattern)) print $0
 }
@@ -180,6 +183,39 @@ discover_llama_processes() {
 
         echo "${pid} ${user} ${args}"
     done <<< "${filtered}"
+}
+
+# ── Process classification helpers ────────────────────────────────────
+
+# Check if an executable basename is an Ollama process.
+# Args: $1 = executable basename (e.g., "ollama")
+# Returns: 0 (true) if it matches OLLAMA_PATTERN
+is_ollama_process() {
+    local exe_basename="$1"
+    echo "${exe_basename}" | grep -qE "${OLLAMA_PATTERN}"
+}
+
+# Check if an executable basename is a llama.cpp process.
+# Args: $1 = executable basename (e.g., "llama-server")
+# Returns: 0 (true) if it matches LLAMA_PATTERN and is NOT ollama
+is_llama_process() {
+    local exe_basename="$1"
+    is_ollama_process "${exe_basename}" && return 1
+    echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"
+}
+
+# Classify a process by its executable basename.
+# Args: $1 = executable basename
+# Outputs: "ollama", "llama", or "other"
+classify_gpu_process() {
+    local exe_basename="$1"
+    if is_ollama_process "${exe_basename}"; then
+        echo "ollama"
+    elif is_llama_process "${exe_basename}"; then
+        echo "llama"
+    else
+        echo "other"
+    fi
 }
 
 # Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
@@ -447,6 +483,14 @@ calculate_idle_score() {
     local reasons=()
     local now
     now="$(date +%s)"
+
+    # Defense-in-depth: Ollama processes are exempt from scoring
+    local exe_basename
+    exe_basename="$(basename "$(echo "${cmdline}" | awk '{print $1}')")"
+    if is_ollama_process "${exe_basename}"; then
+        echo "0 ollama-process: exempt from scoring"
+        return 0
+    fi
 
     # --- a. GPU compute activity (per-process via pmon) ---
     local gpu_mem
@@ -1812,6 +1856,7 @@ cmd_kill() {
     ensure_dirs
 
     local any_killed=false
+    local skipped=0
 
     for target_pid in "$@"; do
         # Validate PID is numeric
@@ -1834,11 +1879,20 @@ cmd_kill() {
             continue
         fi
 
-        # Verify it matches LLAMA_PATTERN (basename check)
+        # Extract executable basename for classification
         local exe_path exe_basename
         exe_path="$(echo "${proc_args}" | awk '{print $1}')"
         exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
 
+        # Explicit Ollama protection — refuse to kill Ollama processes
+        if is_ollama_process "${exe_basename}"; then
+            echo "  ${YELLOW}PROTECTED${RESET}: PID ${target_pid} (${exe_basename}) is an Ollama process managed by systemd."
+            echo "  Use 'systemctl stop ollama' to stop the Ollama server."
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Verify it matches LLAMA_PATTERN (basename check)
         if ! echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"; then
             echo "  ERROR: PID ${target_pid} (${exe_basename}) is not a llama.cpp process (skipping)"
             continue
