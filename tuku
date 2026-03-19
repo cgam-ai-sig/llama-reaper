@@ -137,26 +137,26 @@ json_escape() {
     printf '%s' "$s"
 }
 
-# Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
-# In user mode (SYSTEM_MODE=false), filters to current user only.
-# Matches LLAMA_PATTERN against the executable basename only.
-find_llama_processes() {
-    local current_user
-    current_user="$(whoami)"
+# Discover processes matching a pattern via ps + awk filtering.
+# Outputs lines of "PID USER ARGS..." to stdout.
+# Args:
+#   --user-only   Only show processes owned by current user
+# Globals read: LLAMA_PATTERN, EXCLUDED_BASENAMES
+discover_llama_processes() {
+    local user_only=false
+    local current_user=""
+    if [[ "${1:-}" == "--user-only" ]]; then
+        user_only=true
+        current_user="$(whoami)"
+    fi
 
-    # Pre-filter: single awk pass extracts matching lines only
     local filtered
     filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
 {
-    # Extract the executable basename from the command (first word of args)
     cmd = $3
     n = split(cmd, parts, "/")
     exe = parts[n]
-
-    # Skip excluded basenames
     if (match(exe, excluded)) next
-
-    # Match against llama pattern
     if (match(exe, pattern)) print $0
 }
 ')" || return 0
@@ -174,13 +174,23 @@ find_llama_processes() {
         # Skip ourselves
         [[ "${pid}" == "$$" ]] && continue
 
-        # In user mode, skip processes not owned by current user
-        if [[ "${SYSTEM_MODE}" == false ]] && [[ "${user}" != "${current_user}" ]]; then
+        if [[ "${user_only}" == true ]] && [[ "${user}" != "${current_user}" ]]; then
             continue
         fi
 
         echo "${pid} ${user} ${args}"
     done <<< "${filtered}"
+}
+
+# Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
+# In user mode (SYSTEM_MODE=false), filters to current user only.
+# Matches LLAMA_PATTERN against the executable basename only.
+find_llama_processes() {
+    if [[ "${SYSTEM_MODE}" == false ]]; then
+        discover_llama_processes --user-only
+    else
+        discover_llama_processes
+    fi
 }
 
 # Get listen port for a process — try args first, then ss fallback
@@ -1105,29 +1115,17 @@ DASH_LLAMA_STATUS_COLORS=()
 
 # Dashboard-specific process discovery (uses cached GPU data, API fallbacks)
 find_llama_for_dashboard() {
-    # Pre-filter: single awk pass extracts matching lines only
-    local filtered
-    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
-{
-    cmd = $3
-    n = split(cmd, parts, "/")
-    exe = parts[n]
-    if (match(exe, excluded)) next
-    if (match(exe, pattern)) print $0
-}
-')" || return 0
+    local process_lines
+    process_lines="$(discover_llama_processes)"
+    [[ -z "${process_lines}" ]] && return 0
 
-    [[ -z "${filtered}" ]] && return 0
-
-    while IFS= read -r line; do
-        [[ -z "${line}" ]] && continue
+    while IFS= read -r proc_line; do
+        [[ -z "${proc_line}" ]] && continue
 
         local pid user args
-        pid="$(echo "${line}" | awk '{print $1}')"
-        user="$(echo "${line}" | awk '{print $2}')"
-        args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
-
-        [[ "${pid}" == "$$" ]] && continue
+        pid="$(echo "${proc_line}" | awk '{print $1}')"
+        user="$(echo "${proc_line}" | awk '{print $2}')"
+        args="$(echo "${proc_line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
         DASH_LLAMA_PIDS+=("${pid}")
         DASH_LLAMA_USERS+=("${user}")
@@ -1168,7 +1166,7 @@ find_llama_for_dashboard() {
         status_color="${status_result##*|}"
         DASH_LLAMA_STATUSES+=("${status_text}")
         DASH_LLAMA_STATUS_COLORS+=("${status_color}")
-    done <<< "${filtered}"
+    done <<< "${process_lines}"
 }
 
 render_llama() {
@@ -1480,17 +1478,8 @@ cmd_list() {
         esac
     done
 
-    # Pre-filter: single awk pass extracts matching lines only
-    local filtered
-    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
-{
-    cmd = $3
-    n = split(cmd, parts, "/")
-    exe = parts[n]
-    if (match(exe, excluded)) next
-    if (match(exe, pattern)) print $0
-}
-')" || { echo "Failed to run ps"; exit 1; }
+    local process_lines
+    process_lines="$(discover_llama_processes)"
 
     # Get GPU processes once (reap-style query for scoring)
     local gpu_procs
@@ -1507,7 +1496,7 @@ cmd_list() {
     local now
     now="$(date +%s)"
 
-    if [[ -z "${filtered}" ]]; then
+    if [[ -z "${process_lines}" ]]; then
         if [[ "${output_mode}" == "json" ]]; then
             printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
         else
@@ -1516,15 +1505,13 @@ cmd_list() {
         return 0
     fi
 
-    while IFS= read -r line; do
-        [[ -z "${line}" ]] && continue
+    while IFS= read -r proc_line; do
+        [[ -z "${proc_line}" ]] && continue
 
         local pid user args
-        pid="$(echo "${line}" | awk '{print $1}')"
-        user="$(echo "${line}" | awk '{print $2}')"
-        args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
-
-        [[ "${pid}" == "$$" ]] && continue
+        pid="$(echo "${proc_line}" | awk '{print $1}')"
+        user="$(echo "${proc_line}" | awk '{print $2}')"
+        args="$(echo "${proc_line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
         # GPU memory
         local gpu_mem="-"
@@ -1575,7 +1562,7 @@ cmd_list() {
         done
 
         entries+=("${pid}|${user}|${gpu_mem}|${port}|${uptime_str}|${score}|${model}|${last_active_str}")
-    done <<< "${filtered}"
+    done <<< "${process_lines}"
 
     if [[ ${#entries[@]} -eq 0 ]]; then
         if [[ "${output_mode}" == "json" ]]; then
