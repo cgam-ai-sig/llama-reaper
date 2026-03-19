@@ -39,11 +39,19 @@ PROTECTED_PATTERNS="${TUKU_PROTECTED_PATTERNS:-ollama}"   # Protected from reap/
 # Safety net: common non-llama executables to skip
 readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
 
-# Scoring threshold
-readonly SCORE_KILL=8
+# Per-category scoring thresholds
+SCORE_KILL_LLAMA=8                          # Kill threshold for llama.cpp processes
+SCORE_KILL_OTHER=10                         # Kill threshold for other GPU processes (more conservative)
+
+# Per-category minimum age
+MIN_AGE_LLAMA=60                            # Min age before reaping llama.cpp (minutes)
+MIN_AGE_OTHER=120                           # Min age before reaping other GPU processes (minutes)
+
+# Backward compat aliases (used by render_reap_json header, etc.)
+SCORE_KILL=${SCORE_KILL_LLAMA}              # Backward compat (used by render_reap_json header)
+MIN_AGE_MINUTES=${MIN_AGE_LLAMA}            # Backward compat
 
 # Reap defaults
-MIN_AGE_MINUTES=60
 MAX_IDLE_MINUTES=30
 DRY_RUN=false
 VERBOSE=false
@@ -480,6 +488,7 @@ read_alive_timestamp() {
 calculate_idle_score() {
     local pid="$1" user="$2" cmdline="$3"
     local is_readonly="${4:-false}"
+    local min_age_minutes="${5:-${MIN_AGE_LLAMA}}"
     local score=0
     local reasons=()
     local now
@@ -586,9 +595,9 @@ calculate_idle_score() {
             reasons+=("uptime $(format_uptime "${age_seconds}") (+0)")
         fi
 
-        if [[ ${age_minutes} -lt ${MIN_AGE_MINUTES} ]]; then
+        if [[ ${age_minutes} -lt ${min_age_minutes} ]]; then
             score=0
-            reasons+=("process younger than --min-age (${MIN_AGE_MINUTES}m), NOT eligible")
+            reasons+=("process younger than --min-age (${min_age_minutes}m), NOT eligible")
         fi
     fi
 
@@ -657,16 +666,18 @@ Usage: tuku reap [OPTIONS]
 Run idle process detection and cleanup.
 
 Options:
-  --min-age MINUTES   Minimum age before a process is eligible (default: 60)
-  --max-idle MINUTES  Continuous idle time before killing (default: 30)
-  --dry-run           Show what would happen without killing
-  --verbose           Show detailed idle scoring for each process
-  --json              Output results as JSON
-  --force             Skip --max-idle duration check; kill immediately if idle
-  --system            Manage ALL users' processes (for system cron)
-  --protected PAT   Pipe-delimited regex of protected process patterns (default: ollama)
-                      Env: TUKU_PROTECTED_PATTERNS
-  --help, -h          Show this help message
+  --min-age MINUTES     Minimum age before a llama.cpp process is eligible (default: 60)
+  --min-age-other N     Min age in minutes for non-llama processes (default: 120)
+  --max-idle MINUTES    Continuous idle time before killing (default: 30)
+  --score-kill-other N  Score threshold for non-llama GPU processes (default: 10)
+  --dry-run             Show what would happen without killing
+  --verbose             Show detailed idle scoring for each process
+  --json                Output results as JSON
+  --force               Skip --max-idle duration check; kill immediately if idle
+  --system              Manage ALL users' processes (for system cron)
+  --protected PAT     Pipe-delimited regex of protected process patterns (default: ollama)
+                        Env: TUKU_PROTECTED_PATTERNS
+  --help, -h            Show this help message
 
 Scoring System:
   No GPU memory at all ................ +3
@@ -676,7 +687,11 @@ Scoring System:
   Running > 2 hours ................... +1
   Running > 8 hours ................... +2
 
-  Score >= 8 and idle for >= --max-idle minutes: KILL
+  Per-category thresholds:
+    llama.cpp:  score >= 8  and idle for >= --max-idle minutes: KILL
+    other GPU:  score >= 10 and idle for >= --max-idle minutes: KILL (more conservative)
+
+  Non-llama processes also require a longer minimum age (120m vs 60m).
 
 Examples:
   tuku reap                           # Run once in user mode
@@ -699,7 +714,13 @@ cmd_reap() {
         case "$1" in
             --min-age)
                 [[ -n "${2:-}" ]] || die "--min-age requires a value"
-                MIN_AGE_MINUTES="$2"; shift 2 ;;
+                MIN_AGE_LLAMA="$2"; MIN_AGE_MINUTES="${MIN_AGE_LLAMA}"; shift 2 ;;
+            --min-age-other)
+                [[ -n "${2:-}" ]] || die "--min-age-other requires a value"
+                MIN_AGE_OTHER="$2"; shift 2 ;;
+            --score-kill-other)
+                [[ -n "${2:-}" ]] || die "--score-kill-other requires a value"
+                SCORE_KILL_OTHER="$2"; shift 2 ;;
             --max-idle)
                 [[ -n "${2:-}" ]] || die "--max-idle requires a value"
                 MAX_IDLE_MINUTES="$2"; shift 2 ;;
@@ -729,8 +750,8 @@ cmd_reap() {
 
     if [[ -z "${processes}" ]]; then
         if [[ "${output_mode}" == "json" ]]; then
-            printf '{"dry_run": %s, "score_threshold": %s, "min_age_minutes": %s, "max_idle_minutes": %s, "process_count": 0, "processes": []}\n' \
-                "${DRY_RUN}" "${SCORE_KILL}" "${MIN_AGE_MINUTES}" "${MAX_IDLE_MINUTES}"
+            printf '{"dry_run": %s, "thresholds": {"llama": {"score_kill": %s, "min_age_minutes": %s}, "other": {"score_kill": %s, "min_age_minutes": %s}}, "max_idle_minutes": %s, "process_count": 0, "processes": []}\n' \
+                "${DRY_RUN}" "${SCORE_KILL_LLAMA}" "${MIN_AGE_LLAMA}" "${SCORE_KILL_OTHER}" "${MIN_AGE_OTHER}" "${MAX_IDLE_MINUTES}"
         else
             [[ "${VERBOSE}" == true ]] && echo "No llama.cpp processes found."
         fi
@@ -755,13 +776,27 @@ cmd_reap() {
             continue
         fi
 
+        # Classify process and select per-category thresholds
+        local exe_basename
+        exe_basename="$(basename "$(echo "${cmdline}" | awk '{print $1}')")"
+        local category
+        category="$(classify_gpu_process "${exe_basename}")"
+        local score_kill min_age
+        if [[ "${category}" == "llama" ]]; then
+            score_kill=${SCORE_KILL_LLAMA}
+            min_age=${MIN_AGE_LLAMA}
+        else
+            score_kill=${SCORE_KILL_OTHER}
+            min_age=${MIN_AGE_OTHER}
+        fi
+
         local port
         port="$(get_listen_port "${pid}" "${cmdline}")"
         local model
         model="$(get_model_name "${pid}" "${cmdline}" "${port}")"
 
         local score_result score reason
-        score_result="$(calculate_idle_score "${pid}" "${user}" "${cmdline}")"
+        score_result="$(calculate_idle_score "${pid}" "${user}" "${cmdline}" false "${min_age}")"
         score="$(echo "${score_result}" | awk '{print $1}')"
         reason="$(echo "${score_result}" | cut -d' ' -f2-)"
 
@@ -770,7 +805,7 @@ cmd_reap() {
             echo "    ${reason}"
         fi
 
-        if [[ ${score} -ge ${SCORE_KILL} ]]; then
+        if [[ ${score} -ge ${score_kill} ]]; then
             if [[ "${FORCE}" == true ]]; then
                 if [[ "${output_mode}" == "json" ]]; then
                     kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}" > /dev/null
@@ -778,9 +813,9 @@ cmd_reap() {
                     kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
                 fi
                 if [[ "${DRY_RUN}" == true ]]; then
-                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|would_kill|forced")
+                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|would_kill|forced|${category}|${score_kill}")
                 else
-                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|killed|forced")
+                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|killed|forced|${category}|${score_kill}")
                 fi
             else
                 local alive_ts
@@ -792,7 +827,7 @@ cmd_reap() {
                         echo "    → First idle detection, creating .alive timestamp, skipping"
                     fi
                     log_msg "IDLE" "PID=${pid} user=${user} model=${model} score=${score} reason=[first idle detection, benefit of the doubt]"
-                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|first_idle|")
+                    reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|first_idle||${category}|${score_kill}")
                 else
                     local idle_since=$((now - alive_ts))
                     local max_idle_seconds=$((MAX_IDLE_MINUTES * 60))
@@ -804,9 +839,9 @@ cmd_reap() {
                             kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
                         fi
                         if [[ "${DRY_RUN}" == true ]]; then
-                            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|would_kill|idle $((idle_since / 60))m")
+                            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|would_kill|idle $((idle_since / 60))m|${category}|${score_kill}")
                         else
-                            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|killed|idle $((idle_since / 60))m")
+                            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|killed|idle $((idle_since / 60))m|${category}|${score_kill}")
                         fi
                     else
                         local remaining_minutes=$(( (max_idle_seconds - idle_since) / 60 ))
@@ -814,7 +849,7 @@ cmd_reap() {
                             echo "    → Idle but within --max-idle window (last active $((idle_since / 60))m ago, ${remaining_minutes}m remaining)"
                         fi
                         log_msg "IDLE" "PID=${pid} user=${user} model=${model} score=${score} reason=[idle but within max-idle window, last active $((idle_since / 60))m ago]"
-                        reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|idle_waiting|idle $((idle_since / 60))m, ${remaining_minutes}m remaining")
+                        reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|idle_waiting|idle $((idle_since / 60))m, ${remaining_minutes}m remaining|${category}|${score_kill}")
                     fi
                 fi
             fi
@@ -823,7 +858,7 @@ cmd_reap() {
                 write_alive_timestamp "${pid}"
             fi
             log_msg "SKIP" "PID=${pid} user=${user} model=${model} score=${score} reason=[below threshold]"
-            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|skipped|score below threshold")
+            reap_results+=("${pid}|${user}|${model}|${port}|${score}|${reason}|skipped|score below threshold|${category}|${score_kill}")
         fi
     done <<< "${processes}"
 
@@ -1609,8 +1644,10 @@ render_reap_json() {
 
     printf '{\n'
     printf '  "dry_run": %s,\n' "${DRY_RUN}"
-    printf '  "score_threshold": %s,\n' "${SCORE_KILL}"
-    printf '  "min_age_minutes": %s,\n' "${MIN_AGE_MINUTES}"
+    printf '  "thresholds": {\n'
+    printf '    "llama": {"score_kill": %s, "min_age_minutes": %s},\n' "${SCORE_KILL_LLAMA}" "${MIN_AGE_LLAMA}"
+    printf '    "other": {"score_kill": %s, "min_age_minutes": %s}\n' "${SCORE_KILL_OTHER}" "${MIN_AGE_OTHER}"
+    printf '  },\n'
     printf '  "max_idle_minutes": %s,\n' "${MAX_IDLE_MINUTES}"
     printf '  "process_count": %s,\n' "${#_results[@]}"
     printf '  "processes": [\n'
@@ -1620,9 +1657,9 @@ render_reap_json() {
             local comma=","
             [[ $i -eq $(( ${#_results[@]} - 1 )) ]] && comma=""
 
-            IFS='|' read -r pid user model port score reason action detail <<< "${_results[$i]}"
+            IFS='|' read -r pid user model port score reason action detail category threshold <<< "${_results[$i]}"
 
-            printf '    {"pid": %s, "user": "%s", "model": "%s", "port": "%s", "score": %s, "reasons": "%s", "action": "%s", "detail": "%s"}%s\n' \
+            printf '    {"pid": %s, "user": "%s", "model": "%s", "port": "%s", "score": %s, "reasons": "%s", "action": "%s", "detail": "%s", "category": "%s", "threshold": %s}%s\n' \
                 "${pid}" \
                 "$(json_escape "${user}")" \
                 "$(json_escape "${model}")" \
@@ -1631,6 +1668,8 @@ render_reap_json() {
                 "$(json_escape "${reason}")" \
                 "$(json_escape "${action}")" \
                 "$(json_escape "${detail}")" \
+                "$(json_escape "${category}")" \
+                "${threshold}" \
                 "${comma}"
         done
     fi
@@ -1711,10 +1750,22 @@ cmd_list() {
         [[ "${port_for_model}" == "-" ]] && port_for_model=""
         model="$(get_model_name "${pid}" "${args}" "${port_for_model}")"
 
+        # Classify process and select per-category min_age
+        local exe_basename_cls
+        exe_basename_cls="$(basename "$(echo "${args}" | awk '{print $1}')")"
+        local category_cls
+        category_cls="$(classify_gpu_process "${exe_basename_cls}")"
+        local min_age_cls
+        if [[ "${category_cls}" == "llama" ]]; then
+            min_age_cls=${MIN_AGE_LLAMA}
+        else
+            min_age_cls=${MIN_AGE_OTHER}
+        fi
+
         # Idle score (readonly mode)
         ensure_dirs
         local score_result score
-        score_result="$(calculate_idle_score "${pid}" "${user}" "${args}" true)"
+        score_result="$(calculate_idle_score "${pid}" "${user}" "${args}" true "${min_age_cls}")"
         score="$(echo "${score_result}" | awk '{print $1}')"
 
         # Check for .alive files in ALL state dirs
