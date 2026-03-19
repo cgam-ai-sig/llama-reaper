@@ -33,7 +33,8 @@ readonly SYSTEM_CRON_FILE="/etc/cron.d/tuku"
 
 # Llama process name patterns (extended regex for grep -E)
 readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama[.]cpp'
-readonly OLLAMA_PATTERN='ollama'                    # Ollama — protected from reap/kill
+readonly OLLAMA_PATTERN='ollama'                    # Legacy: default for PROTECTED_PATTERNS
+PROTECTED_PATTERNS="${TUKU_PROTECTED_PATTERNS:-ollama}"   # Protected from reap/kill (pipe-delimited regex)
 
 # Safety net: common non-llama executables to skip
 readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
@@ -152,13 +153,13 @@ discover_llama_processes() {
     fi
 
     local filtered
-    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" -v ollama="${OLLAMA_PATTERN}" '
+    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" -v protected_pat="${PROTECTED_PATTERNS}" '
 {
     cmd = $3
     n = split(cmd, parts, "/")
     exe = parts[n]
-    # Never match Ollama processes (explicit protection)
-    if (match(exe, ollama)) next
+    # Never match protected processes (explicit protection)
+    if (match(exe, protected_pat)) next
     if (match(exe, excluded)) next
     if (match(exe, pattern)) print $0
 }
@@ -187,30 +188,30 @@ discover_llama_processes() {
 
 # ── Process classification helpers ────────────────────────────────────
 
-# Check if an executable basename is an Ollama process.
-# Args: $1 = executable basename (e.g., "ollama")
-# Returns: 0 (true) if it matches OLLAMA_PATTERN
-is_ollama_process() {
+# Check if an executable basename matches any protected pattern.
+# Args: $1 = executable basename
+# Returns: 0 (true) if protected
+is_protected_process() {
     local exe_basename="$1"
-    echo "${exe_basename}" | grep -qE "${OLLAMA_PATTERN}"
+    echo "${exe_basename}" | grep -qE "${PROTECTED_PATTERNS}"
 }
 
 # Check if an executable basename is a llama.cpp process.
 # Args: $1 = executable basename (e.g., "llama-server")
-# Returns: 0 (true) if it matches LLAMA_PATTERN and is NOT ollama
+# Returns: 0 (true) if it matches LLAMA_PATTERN and is NOT protected
 is_llama_process() {
     local exe_basename="$1"
-    is_ollama_process "${exe_basename}" && return 1
+    is_protected_process "${exe_basename}" && return 1
     echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"
 }
 
 # Classify a process by its executable basename.
 # Args: $1 = executable basename
-# Outputs: "ollama", "llama", or "other"
+# Outputs: "protected", "llama", or "other"
 classify_gpu_process() {
     local exe_basename="$1"
-    if is_ollama_process "${exe_basename}"; then
-        echo "ollama"
+    if is_protected_process "${exe_basename}"; then
+        echo "protected"
     elif is_llama_process "${exe_basename}"; then
         echo "llama"
     else
@@ -484,11 +485,11 @@ calculate_idle_score() {
     local now
     now="$(date +%s)"
 
-    # Defense-in-depth: Ollama processes are exempt from scoring
+    # Defense-in-depth: Protected processes are exempt from scoring
     local exe_basename
     exe_basename="$(basename "$(echo "${cmdline}" | awk '{print $1}')")"
-    if is_ollama_process "${exe_basename}"; then
-        echo "0 ollama-process: exempt from scoring"
+    if is_protected_process "${exe_basename}"; then
+        echo "0 protected-process: exempt from scoring"
         return 0
     fi
 
@@ -663,6 +664,8 @@ Options:
   --json              Output results as JSON
   --force             Skip --max-idle duration check; kill immediately if idle
   --system            Manage ALL users' processes (for system cron)
+  --protected PAT   Pipe-delimited regex of protected process patterns (default: ollama)
+                      Env: TUKU_PROTECTED_PATTERNS
   --help, -h          Show this help message
 
 Scoring System:
@@ -705,6 +708,9 @@ cmd_reap() {
             --json)      output_mode="json"; shift ;;
             --force)     FORCE=true; shift ;;
             --system)    SYSTEM_MODE=true; shift ;;
+            --protected)
+                [[ -n "${2:-}" ]] || die "--protected requires a PATTERNS value"
+                PROTECTED_PATTERNS="$2"; shift 2 ;;
             --help|-h)   usage_reap ;;
             *)           die "Unknown reap option: $1. Run 'tuku reap --help'." ;;
         esac
@@ -1258,10 +1264,10 @@ find_other_gpu_for_dashboard() {
         elapsed_secs="$(echo "${ps_info}" | awk '{print $2}')"
         cmdline="$(echo "${ps_info}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
-        # Classify — skip ollama
+        # Classify — skip protected processes
         local exe_basename
         exe_basename="$(echo "${cmdline}" | awk '{n=split($1,a,"/"); print a[n]}')"
-        if is_ollama_process "${exe_basename}"; then
+        if is_protected_process "${exe_basename}"; then
             continue
         fi
 
@@ -1329,7 +1335,7 @@ render_llama() {
 
 # ---------- Reaper config display ----------
 
-REAPER_STATUS="" REAPER_INTERVAL="" REAPER_MIN_AGE="" REAPER_MAX_IDLE=""
+REAPER_STATUS="" REAPER_INTERVAL="" REAPER_MIN_AGE="" REAPER_MAX_IDLE="" REAPER_PROTECTED=""
 
 fetch_reaper() {
     local cron_file="/etc/cron.d/tuku"
@@ -1338,6 +1344,7 @@ fetch_reaper() {
         REAPER_INTERVAL="$(sed -n 's/^\*\/\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_INTERVAL=""
         REAPER_MIN_AGE="$(sed -n 's/.*--min-age[[:space:]]\+\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_MIN_AGE=""
         REAPER_MAX_IDLE="$(sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' "${cron_file}" 2>/dev/null | head -1)" || REAPER_MAX_IDLE=""
+        REAPER_PROTECTED="$(sed -n "s/.*--protected[[:space:]]\+'\([^']\+\)'.*/\1/p" "${cron_file}" 2>/dev/null | head -1)" || REAPER_PROTECTED=""
         return
     fi
 
@@ -1348,6 +1355,7 @@ fetch_reaper() {
         REAPER_INTERVAL="$(echo "${user_cron}" | grep "tuku" | sed -n 's/^\*\/\([0-9]\+\).*/\1/p' | head -1)" || REAPER_INTERVAL=""
         REAPER_MIN_AGE="$(echo "${user_cron}" | grep "tuku" | sed -n 's/.*--min-age[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MIN_AGE=""
         REAPER_MAX_IDLE="$(echo "${user_cron}" | grep "tuku" | sed -n 's/.*--max-idle[[:space:]]\+\([0-9]\+\).*/\1/p' | head -1)" || REAPER_MAX_IDLE=""
+        REAPER_PROTECTED="$(echo "${user_cron}" | grep "tuku" | sed -n "s/.*--protected[[:space:]]\+'\([^']\+\)'.*/\1/p" | head -1)" || REAPER_PROTECTED=""
         return
     fi
 
@@ -1774,6 +1782,7 @@ Options:
                        Passed through to the cron entry.
   --max-idle MINUTES   Continuous idle duration before killing (default: 30).
                        Passed through to the cron entry.
+  --protected PAT   Protected patterns to embed in cron (default: ollama)
   --help, -h           Show this help message
 
 User mode (default):
@@ -1787,6 +1796,7 @@ Examples:
   tuku install                              # User cron, defaults
   tuku install --interval 3 --min-age 30    # Every 3min, 30min age gate
   tuku install --system --max-idle 15        # System-wide, 15min idle
+  tuku install --system --protected "ollama|jupyter"  # Protect multiple patterns
 EOF
     exit 0
 }
@@ -1808,6 +1818,7 @@ install_user() {
     local interval="$1"
     local min_age="${2:-}"
     local max_idle="${3:-}"
+    local protected="${4:-}"
 
     local existing
     existing="$(crontab -l 2>/dev/null || true)"
@@ -1821,6 +1832,7 @@ install_user() {
     local extra_flags=""
     [[ -n "${min_age}" ]] && extra_flags+=" --min-age ${min_age}"
     [[ -n "${max_idle}" ]] && extra_flags+=" --max-idle ${max_idle}"
+    [[ -n "${protected}" ]] && extra_flags+=" --protected '${protected}'"
 
     local cron_line="*/${interval} * * * * ${SCRIPT_PATH} reap${extra_flags} ${CRON_MARKER}"
 
@@ -1837,11 +1849,13 @@ install_system() {
     local interval="$1"
     local min_age="${2:-}"
     local max_idle="${3:-}"
+    local protected="${4:-}"
 
     if [[ "$(id -u)" -ne 0 ]]; then
         local extra_args=()
         [[ -n "${min_age}" ]] && extra_args+=(--min-age "${min_age}")
         [[ -n "${max_idle}" ]] && extra_args+=(--max-idle "${max_idle}")
+        [[ -n "${protected}" ]] && extra_args+=(--protected "${protected}")
         echo "System install requires root. Re-running with sudo..."
         exec sudo "${SCRIPT_PATH}" install --system --interval "${interval}" "${extra_args[@]}"
     fi
@@ -1849,6 +1863,7 @@ install_system() {
     local extra_flags=""
     [[ -n "${min_age}" ]] && extra_flags+=" --min-age ${min_age}"
     [[ -n "${max_idle}" ]] && extra_flags+=" --max-idle ${max_idle}"
+    [[ -n "${protected}" ]] && extra_flags+=" --protected '${protected}'"
 
     cat > "${SYSTEM_CRON_FILE}" <<EOF
 # tuku: watchdog for idle llama.cpp processes
@@ -1899,6 +1914,7 @@ cmd_install() {
     local interval=1
     local min_age=""
     local max_idle=""
+    local protected=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1912,15 +1928,18 @@ cmd_install() {
             --max-idle)
                 [[ -n "${2:-}" ]] || die "--max-idle requires a value"
                 max_idle="$2"; shift 2 ;;
+            --protected)
+                [[ -n "${2:-}" ]] || die "--protected requires a PATTERNS value"
+                protected="$2"; shift 2 ;;
             --help|-h)  usage_install ;;
             *)          die "Unknown install option: $1" ;;
         esac
     done
 
     if [[ "${system}" == true ]]; then
-        install_system "${interval}" "${min_age}" "${max_idle}"
+        install_system "${interval}" "${min_age}" "${max_idle}" "${protected}"
     else
-        install_user "${interval}" "${min_age}" "${max_idle}"
+        install_user "${interval}" "${min_age}" "${max_idle}" "${protected}"
     fi
 }
 
@@ -2092,7 +2111,7 @@ cmd_gpu() {
         # Color type labels
         local type_colored="${e_type}"
         case "${e_type}" in
-            ollama) type_colored="${CYAN}ollama${RESET}" ;;
+            protected) type_colored="${CYAN}protected${RESET}" ;;
             llama)  type_colored="${GREEN}llama${RESET}" ;;
             other)  type_colored="${YELLOW}other${RESET}" ;;
         esac
@@ -2115,10 +2134,11 @@ Manually kill one or more GPU processes.
 Verifies that each PID is actually using the GPU before killing.
 Uses SIGTERM first, waits 10 seconds, then SIGKILL if needed.
 
-Ollama processes are protected by default. Use --force to override.
+Protected processes (matching PROTECTED_PATTERNS) are shielded by default.
+Use --force to override.
 
 Options:
-  --force, -f  Force kill even Ollama processes (bypasses protection)
+  --force, -f  Force kill even protected processes (bypasses protection)
   --help, -h   Show this help
 
 Examples:
@@ -2181,13 +2201,13 @@ cmd_kill() {
         exe_path="$(echo "${proc_args}" | awk '{print $1}')"
         exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
 
-        # Ollama protection — refuse unless --force
-        if is_ollama_process "${exe_basename}"; then
+        # Protected process guard — refuse unless --force
+        if is_protected_process "${exe_basename}"; then
             if [[ "${force_kill}" == true ]]; then
-                echo "  ${YELLOW}WARNING${RESET}: Force-killing Ollama process PID ${target_pid}."
+                echo "  ${YELLOW}WARNING${RESET}: Force-killing protected process PID ${target_pid}."
             else
-                echo "  ${YELLOW}PROTECTED${RESET}: PID ${target_pid} (${exe_basename}) is an Ollama process managed by systemd."
-                echo "  Use 'tuku kill --force ${target_pid}' to kill anyway."
+                echo "  ${YELLOW}PROTECTED${RESET}: PID ${target_pid} (${exe_basename}) is a protected process (matches PROTECTED_PATTERNS)."
+                echo "  Use 'tuku kill --force ${target_pid}' to override protection."
                 skipped=$((skipped + 1))
                 continue
             fi
