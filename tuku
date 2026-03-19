@@ -33,6 +33,7 @@ readonly SYSTEM_CRON_FILE="/etc/cron.d/tuku"
 
 # Llama process name patterns (extended regex for grep -E)
 readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama[.]cpp'
+readonly OLLAMA_PATTERN='ollama'                    # Ollama — protected from reap/kill
 
 # Safety net: common non-llama executables to skip
 readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
@@ -137,26 +138,28 @@ json_escape() {
     printf '%s' "$s"
 }
 
-# Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
-# In user mode (SYSTEM_MODE=false), filters to current user only.
-# Matches LLAMA_PATTERN against the executable basename only.
-find_llama_processes() {
-    local current_user
-    current_user="$(whoami)"
+# Discover processes matching a pattern via ps + awk filtering.
+# Outputs lines of "PID USER ARGS..." to stdout.
+# Args:
+#   --user-only   Only show processes owned by current user
+# Globals read: LLAMA_PATTERN, EXCLUDED_BASENAMES
+discover_llama_processes() {
+    local user_only=false
+    local current_user=""
+    if [[ "${1:-}" == "--user-only" ]]; then
+        user_only=true
+        current_user="$(whoami)"
+    fi
 
-    # Pre-filter: single awk pass extracts matching lines only
     local filtered
-    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
+    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" -v ollama="${OLLAMA_PATTERN}" '
 {
-    # Extract the executable basename from the command (first word of args)
     cmd = $3
     n = split(cmd, parts, "/")
     exe = parts[n]
-
-    # Skip excluded basenames
+    # Never match Ollama processes (explicit protection)
+    if (match(exe, ollama)) next
     if (match(exe, excluded)) next
-
-    # Match against llama pattern
     if (match(exe, pattern)) print $0
 }
 ')" || return 0
@@ -174,13 +177,56 @@ find_llama_processes() {
         # Skip ourselves
         [[ "${pid}" == "$$" ]] && continue
 
-        # In user mode, skip processes not owned by current user
-        if [[ "${SYSTEM_MODE}" == false ]] && [[ "${user}" != "${current_user}" ]]; then
+        if [[ "${user_only}" == true ]] && [[ "${user}" != "${current_user}" ]]; then
             continue
         fi
 
         echo "${pid} ${user} ${args}"
     done <<< "${filtered}"
+}
+
+# ── Process classification helpers ────────────────────────────────────
+
+# Check if an executable basename is an Ollama process.
+# Args: $1 = executable basename (e.g., "ollama")
+# Returns: 0 (true) if it matches OLLAMA_PATTERN
+is_ollama_process() {
+    local exe_basename="$1"
+    echo "${exe_basename}" | grep -qE "${OLLAMA_PATTERN}"
+}
+
+# Check if an executable basename is a llama.cpp process.
+# Args: $1 = executable basename (e.g., "llama-server")
+# Returns: 0 (true) if it matches LLAMA_PATTERN and is NOT ollama
+is_llama_process() {
+    local exe_basename="$1"
+    is_ollama_process "${exe_basename}" && return 1
+    echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"
+}
+
+# Classify a process by its executable basename.
+# Args: $1 = executable basename
+# Outputs: "ollama", "llama", or "other"
+classify_gpu_process() {
+    local exe_basename="$1"
+    if is_ollama_process "${exe_basename}"; then
+        echo "ollama"
+    elif is_llama_process "${exe_basename}"; then
+        echo "llama"
+    else
+        echo "other"
+    fi
+}
+
+# Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
+# In user mode (SYSTEM_MODE=false), filters to current user only.
+# Matches LLAMA_PATTERN against the executable basename only.
+find_llama_processes() {
+    if [[ "${SYSTEM_MODE}" == false ]]; then
+        discover_llama_processes --user-only
+    else
+        discover_llama_processes
+    fi
 }
 
 # Get listen port for a process — try args first, then ss fallback
@@ -437,6 +483,14 @@ calculate_idle_score() {
     local reasons=()
     local now
     now="$(date +%s)"
+
+    # Defense-in-depth: Ollama processes are exempt from scoring
+    local exe_basename
+    exe_basename="$(basename "$(echo "${cmdline}" | awk '{print $1}')")"
+    if is_ollama_process "${exe_basename}"; then
+        echo "0 ollama-process: exempt from scoring"
+        return 0
+    fi
 
     # --- a. GPU compute activity (per-process via pmon) ---
     local gpu_mem
@@ -1105,29 +1159,17 @@ DASH_LLAMA_STATUS_COLORS=()
 
 # Dashboard-specific process discovery (uses cached GPU data, API fallbacks)
 find_llama_for_dashboard() {
-    # Pre-filter: single awk pass extracts matching lines only
-    local filtered
-    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
-{
-    cmd = $3
-    n = split(cmd, parts, "/")
-    exe = parts[n]
-    if (match(exe, excluded)) next
-    if (match(exe, pattern)) print $0
-}
-')" || return 0
+    local process_lines
+    process_lines="$(discover_llama_processes)"
+    [[ -z "${process_lines}" ]] && return 0
 
-    [[ -z "${filtered}" ]] && return 0
-
-    while IFS= read -r line; do
-        [[ -z "${line}" ]] && continue
+    while IFS= read -r proc_line; do
+        [[ -z "${proc_line}" ]] && continue
 
         local pid user args
-        pid="$(echo "${line}" | awk '{print $1}')"
-        user="$(echo "${line}" | awk '{print $2}')"
-        args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
-
-        [[ "${pid}" == "$$" ]] && continue
+        pid="$(echo "${proc_line}" | awk '{print $1}')"
+        user="$(echo "${proc_line}" | awk '{print $2}')"
+        args="$(echo "${proc_line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
         DASH_LLAMA_PIDS+=("${pid}")
         DASH_LLAMA_USERS+=("${user}")
@@ -1168,7 +1210,84 @@ find_llama_for_dashboard() {
         status_color="${status_result##*|}"
         DASH_LLAMA_STATUSES+=("${status_text}")
         DASH_LLAMA_STATUS_COLORS+=("${status_color}")
-    done <<< "${filtered}"
+    done <<< "${process_lines}"
+}
+
+# ── Find non-llama, non-ollama GPU processes for dashboard ───────────
+
+DASH_OTHER_PIDS=()
+DASH_OTHER_USERS=()
+DASH_OTHER_VRAMS=()
+DASH_OTHER_CMDS=()
+DASH_OTHER_UPTIMES=()
+
+find_other_gpu_for_dashboard() {
+    # Reset arrays
+    DASH_OTHER_PIDS=()
+    DASH_OTHER_USERS=()
+    DASH_OTHER_VRAMS=()
+    DASH_OTHER_CMDS=()
+    DASH_OTHER_UPTIMES=()
+
+    # Need GPU_VRAM_BY_PID from cache_gpu_data
+    [[ ${#GPU_VRAM_BY_PID[@]} -eq 0 ]] && return 0
+
+    local pid
+    for pid in "${!GPU_VRAM_BY_PID[@]}"; do
+        # Skip if already shown in llama.cpp section
+        local is_llama_pid=false
+        local lp
+        for lp in "${DASH_LLAMA_PIDS[@]}"; do
+            if [[ "${lp}" == "${pid}" ]]; then
+                is_llama_pid=true
+                break
+            fi
+        done
+        [[ "${is_llama_pid}" == true ]] && continue
+
+        # Skip if process no longer exists
+        kill -0 "${pid}" 2>/dev/null || continue
+
+        # Get process info
+        local ps_info
+        ps_info="$(ps -p "${pid}" -o user=,etimes=,args= 2>/dev/null)" || continue
+        [[ -z "${ps_info}" ]] && continue
+
+        local user elapsed_secs cmdline
+        user="$(echo "${ps_info}" | awk '{print $1}')"
+        elapsed_secs="$(echo "${ps_info}" | awk '{print $2}')"
+        cmdline="$(echo "${ps_info}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+
+        # Classify — skip ollama
+        local exe_basename
+        exe_basename="$(echo "${cmdline}" | awk '{n=split($1,a,"/"); print a[n]}')"
+        if is_ollama_process "${exe_basename}"; then
+            continue
+        fi
+
+        DASH_OTHER_PIDS+=("${pid}")
+        DASH_OTHER_USERS+=("${user}")
+
+        local vram="${GPU_VRAM_BY_PID[${pid}]}"
+        if [[ -n "${vram}" ]] && [[ "${vram}" != "0" ]]; then
+            DASH_OTHER_VRAMS+=("$(mib_to_gb "${vram}")")
+        else
+            DASH_OTHER_VRAMS+=("-")
+        fi
+
+        # Truncate command
+        local cmd_display="${cmdline}"
+        if [[ ${#cmd_display} -gt 50 ]]; then
+            cmd_display="${cmd_display:0:47}..."
+        fi
+        DASH_OTHER_CMDS+=("${cmd_display}")
+
+        if [[ ${elapsed_secs} -gt 0 ]]; then
+            DASH_OTHER_UPTIMES+=("$(format_uptime "${elapsed_secs}")")
+        else
+            DASH_OTHER_UPTIMES+=("-")
+        fi
+    done
 }
 
 render_llama() {
@@ -1233,6 +1352,25 @@ fetch_reaper() {
     fi
 
     REAPER_STATUS="not installed"
+}
+
+render_other_gpu() {
+    [[ ${#DASH_OTHER_PIDS[@]} -eq 0 ]] && return 0
+
+    print_header "Other GPU Processes"
+    printf "  ${BOLD_WHITE}%-8s %-12s %-10s %-52s %s${RESET}\n" \
+        "PID" "USER" "GPU_MEM" "COMMAND" "UPTIME"
+
+    local i
+    for ((i = 0; i < ${#DASH_OTHER_PIDS[@]}; i++)); do
+        printf "  %-8s %-12s %-10s %-52s %s\n" \
+            "${DASH_OTHER_PIDS[$i]}" \
+            "${DASH_OTHER_USERS[$i]}" \
+            "${DASH_OTHER_VRAMS[$i]}" \
+            "${DASH_OTHER_CMDS[$i]}" \
+            "${DASH_OTHER_UPTIMES[$i]}"
+    done
+    printf "\n"
 }
 
 render_reaper() {
@@ -1302,6 +1440,27 @@ render_json() {
     printf '    ]\n'
     printf '  },\n'
 
+    printf '    "other_gpu": {\n'
+    printf '      "process_count": %d,\n' "${#DASH_OTHER_PIDS[@]}"
+    printf '      "processes": ['
+    if [[ ${#DASH_OTHER_PIDS[@]} -gt 0 ]]; then
+        printf '\n'
+        for ((i = 0; i < ${#DASH_OTHER_PIDS[@]}; i++)); do
+            printf '        {\n'
+            printf '          "pid": %s,\n' "${DASH_OTHER_PIDS[$i]}"
+            printf '          "user": "%s",\n' "$(json_escape "${DASH_OTHER_USERS[$i]}")"
+            printf '          "gpu_mem": "%s",\n' "$(json_escape "${DASH_OTHER_VRAMS[$i]}")"
+            printf '          "command": "%s",\n' "$(json_escape "${DASH_OTHER_CMDS[$i]}")"
+            printf '          "uptime": "%s"\n' "$(json_escape "${DASH_OTHER_UPTIMES[$i]}")"
+            printf '        }'
+            [[ $((i + 1)) -lt ${#DASH_OTHER_PIDS[@]} ]] && printf ','
+            printf '\n'
+        done
+        printf '      '
+    fi
+    printf ']\n'
+    printf '    },\n'
+
     printf '  "reaper": {\n'
     printf '    "status": "%s"' "${REAPER_STATUS}"
     if [[ "${REAPER_STATUS}" == "active" ]]; then
@@ -1335,8 +1494,8 @@ render_compact() {
 
     local llama_str="${#DASH_LLAMA_PIDS[@]} processes"
 
-    printf 'GPU: %s | VRAM: %s | Ollama: %s | llama.cpp: %s\n' \
-        "${gpu_str}" "${vram_str}" "${ollama_str}" "${llama_str}"
+    printf 'GPU: %s | VRAM: %s | Ollama: %s | llama.cpp: %s | Other: %d\n' \
+        "${gpu_str}" "${vram_str}" "${ollama_str}" "${llama_str}" "${#DASH_OTHER_PIDS[@]}"
 }
 
 # ---------- cmd_dashboard() ----------
@@ -1371,6 +1530,7 @@ cmd_dashboard() {
     fetch_ollama
     fetch_reaper                    # Must populate REAPER_STATUS before find_llama_for_dashboard
     find_llama_for_dashboard
+    find_other_gpu_for_dashboard
 
     case "${output_mode}" in
         json)    render_json ;;
@@ -1379,6 +1539,7 @@ cmd_dashboard() {
             render_gpu
             render_ollama
             render_llama
+            render_other_gpu
             render_reaper
             ;;
     esac
@@ -1480,17 +1641,8 @@ cmd_list() {
         esac
     done
 
-    # Pre-filter: single awk pass extracts matching lines only
-    local filtered
-    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
-{
-    cmd = $3
-    n = split(cmd, parts, "/")
-    exe = parts[n]
-    if (match(exe, excluded)) next
-    if (match(exe, pattern)) print $0
-}
-')" || { echo "Failed to run ps"; exit 1; }
+    local process_lines
+    process_lines="$(discover_llama_processes)"
 
     # Get GPU processes once (reap-style query for scoring)
     local gpu_procs
@@ -1507,7 +1659,7 @@ cmd_list() {
     local now
     now="$(date +%s)"
 
-    if [[ -z "${filtered}" ]]; then
+    if [[ -z "${process_lines}" ]]; then
         if [[ "${output_mode}" == "json" ]]; then
             printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
         else
@@ -1516,15 +1668,13 @@ cmd_list() {
         return 0
     fi
 
-    while IFS= read -r line; do
-        [[ -z "${line}" ]] && continue
+    while IFS= read -r proc_line; do
+        [[ -z "${proc_line}" ]] && continue
 
         local pid user args
-        pid="$(echo "${line}" | awk '{print $1}')"
-        user="$(echo "${line}" | awk '{print $2}')"
-        args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
-
-        [[ "${pid}" == "$$" ]] && continue
+        pid="$(echo "${proc_line}" | awk '{print $1}')"
+        user="$(echo "${proc_line}" | awk '{print $2}')"
+        args="$(echo "${proc_line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
         # GPU memory
         local gpu_mem="-"
@@ -1575,7 +1725,7 @@ cmd_list() {
         done
 
         entries+=("${pid}|${user}|${gpu_mem}|${port}|${uptime_str}|${score}|${model}|${last_active_str}")
-    done <<< "${filtered}"
+    done <<< "${process_lines}"
 
     if [[ ${#entries[@]} -eq 0 ]]; then
         if [[ "${output_mode}" == "json" ]]; then
@@ -1793,21 +1943,188 @@ cmd_uninstall() {
 }
 
 # ============================================================
-# SECTION 7: KILL COMMAND
+# SECTION 7: GPU COMMAND
+# ============================================================
+
+usage_gpu() {
+    cat <<'EOF'
+Usage: tuku gpu [OPTIONS]
+
+Show all processes currently using the GPU.
+
+Options:
+  --json       Output as JSON
+  --help, -h   Show this help
+
+Examples:
+  tuku gpu                      # show all GPU processes
+  tuku gpu --json               # machine-readable JSON output
+  tuku gpu --json | jq '.processes[] | select(.type == "other")'
+EOF
+    exit 0
+}
+
+render_gpu_json() {
+    local -n arr=$1
+    local count=${#arr[@]}
+    printf '{\n'
+    printf '  "process_count": %d,\n' "${count}"
+    printf '  "processes": ['
+
+    if [[ ${count} -eq 0 ]]; then
+        printf ']\n}\n'
+        return
+    fi
+
+    printf '\n'
+    local i=0
+    local entry
+    for entry in "${arr[@]}"; do
+        IFS='|' read -r e_pid e_user e_type e_mem e_cmd e_uptime <<< "${entry}"
+        printf '    {\n'
+        printf '      "pid": %s,\n' "${e_pid}"
+        printf '      "user": "%s",\n' "$(json_escape "${e_user}")"
+        printf '      "type": "%s",\n' "$(json_escape "${e_type}")"
+        printf '      "gpu_mem": "%s",\n' "$(json_escape "${e_mem}")"
+        printf '      "command": "%s",\n' "$(json_escape "${e_cmd}")"
+        printf '      "uptime": "%s"\n' "$(json_escape "${e_uptime}")"
+        printf '    }'
+        i=$((i + 1))
+        [[ ${i} -lt ${count} ]] && printf ','
+        printf '\n'
+    done
+    printf '  ]\n'
+    printf '}\n'
+}
+
+cmd_gpu() {
+    local output_mode="default"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    output_mode="json"; shift ;;
+            --help|-h) usage_gpu ;;
+            *)         die "Unknown gpu option: $1. Run 'tuku gpu --help'." ;;
+        esac
+    done
+
+    # Get ALL GPU-using PIDs from nvidia-smi
+    local gpu_procs
+    gpu_procs="$(get_gpu_processes)"
+
+    if [[ -z "${gpu_procs}" ]]; then
+        if [[ "${output_mode}" == "json" ]]; then
+            printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
+            return 0
+        fi
+        echo "No GPU processes found."
+        return 0
+    fi
+
+    local entries=()
+    while IFS= read -r gpu_line; do
+        [[ -z "${gpu_line}" ]] && continue
+        local pid gpu_mem
+        pid="$(echo "${gpu_line}" | awk '{print $1}')"
+        gpu_mem="$(echo "${gpu_line}" | awk '{print $2}')"
+
+        # Skip if process no longer exists
+        kill -0 "${pid}" 2>/dev/null || continue
+
+        # Get process metadata from ps
+        local ps_info
+        ps_info="$(ps -p "${pid}" -o user=,etimes=,args= 2>/dev/null)" || continue
+        [[ -z "${ps_info}" ]] && continue
+
+        local user elapsed_secs cmdline
+        user="$(echo "${ps_info}" | awk '{print $1}')"
+        elapsed_secs="$(echo "${ps_info}" | awk '{print $2}')"
+        cmdline="$(echo "${ps_info}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+
+        # Classify process type
+        local exe_basename
+        exe_basename="$(echo "${cmdline}" | awk '{n=split($1,a,"/"); print a[n]}')"
+        local proc_type
+        proc_type="$(classify_gpu_process "${exe_basename}")"
+
+        # Format uptime
+        local uptime_str="-"
+        if [[ ${elapsed_secs} -gt 0 ]]; then
+            uptime_str="$(format_uptime "${elapsed_secs}")"
+        fi
+
+        # Format GPU memory
+        local gpu_mem_str="${gpu_mem} MiB"
+
+        # Truncate command for display
+        local cmd_display="${cmdline}"
+        if [[ ${#cmd_display} -gt 50 ]]; then
+            cmd_display="${cmd_display:0:47}..."
+        fi
+
+        entries+=("${pid}|${user}|${proc_type}|${gpu_mem_str}|${cmd_display}|${uptime_str}")
+    done <<< "${gpu_procs}"
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        if [[ "${output_mode}" == "json" ]]; then
+            printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
+            return 0
+        fi
+        echo "No GPU processes found."
+        return 0
+    fi
+
+    # Output
+    if [[ "${output_mode}" == "json" ]]; then
+        render_gpu_json entries
+        return 0
+    fi
+
+    # Text table
+    printf '\n'
+    printf "  ${BOLD_WHITE}%-8s %-12s %-8s %-12s %-52s %s${RESET}\n" \
+        "PID" "USER" "TYPE" "GPU_MEM" "COMMAND" "UPTIME"
+    printf "  %-8s %-12s %-8s %-12s %-52s %s\n" \
+        "───" "────" "────" "───────" "───────" "──────"
+
+    local entry
+    for entry in "${entries[@]}"; do
+        IFS='|' read -r e_pid e_user e_type e_mem e_cmd e_uptime <<< "${entry}"
+        # Color type labels
+        local type_colored="${e_type}"
+        case "${e_type}" in
+            ollama) type_colored="${CYAN}ollama${RESET}" ;;
+            llama)  type_colored="${GREEN}llama${RESET}" ;;
+            other)  type_colored="${YELLOW}other${RESET}" ;;
+        esac
+        printf "  %-8s %-12s %-8b %-12s %-52s %s\n" \
+            "${e_pid}" "${e_user}" "${type_colored}" "${e_mem}" "${e_cmd}" "${e_uptime}"
+    done
+    printf "\n  %d GPU process(es) found.\n" "${#entries[@]}"
+}
+
+# ============================================================
+# SECTION 8: KILL COMMAND
 # ============================================================
 
 usage_kill() {
     cat <<'EOF'
-Usage: tuku kill <PID> [PID...]
+Usage: tuku kill [OPTIONS] <PID> [PID...]
 
-Manually kill one or more llama.cpp processes.
+Manually kill one or more GPU processes.
 
-Validates that each PID is a llama.cpp process before killing.
+Verifies that each PID is actually using the GPU before killing.
 Uses SIGTERM first, waits 10 seconds, then SIGKILL if needed.
 
+Ollama processes are protected by default. Use --force to override.
+
+Options:
+  --force, -f  Force kill even Ollama processes (bypasses protection)
+  --help, -h   Show this help
+
 Examples:
-  tuku kill 12345              # Kill a single process
-  tuku kill 12345 67890        # Kill multiple processes
+  tuku kill 12345              # Kill a single GPU process
+  tuku kill 12345 67890        # Kill multiple GPU processes
+  tuku kill --force 12345      # Force kill (even if Ollama)
 EOF
     exit 0
 }
@@ -1817,16 +2134,28 @@ cmd_kill() {
         die "tuku kill requires at least one PID. Run 'tuku kill --help'."
     fi
 
-    # Check for --help
+    local force_kill=false
+    local pids=()
+
+    # Parse args: separate flags from PIDs
     for arg in "$@"; do
-        [[ "${arg}" == "--help" || "${arg}" == "-h" ]] && usage_kill
+        case "${arg}" in
+            --help|-h)   usage_kill ;;
+            --force|-f)  force_kill=true ;;
+            *)           pids+=("${arg}") ;;
+        esac
     done
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        die "tuku kill requires at least one PID. Run 'tuku kill --help'."
+    fi
 
     ensure_dirs
 
     local any_killed=false
+    local skipped=0
 
-    for target_pid in "$@"; do
+    for target_pid in "${pids[@]}"; do
         # Validate PID is numeric
         if ! [[ "${target_pid}" =~ ^[0-9]+$ ]]; then
             echo "  ERROR: '${target_pid}' is not a valid PID (skipping)"
@@ -1847,13 +2176,36 @@ cmd_kill() {
             continue
         fi
 
-        # Verify it matches LLAMA_PATTERN (basename check)
+        # Extract executable basename for classification
         local exe_path exe_basename
         exe_path="$(echo "${proc_args}" | awk '{print $1}')"
         exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
 
-        if ! echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"; then
-            echo "  ERROR: PID ${target_pid} (${exe_basename}) is not a llama.cpp process (skipping)"
+        # Ollama protection — refuse unless --force
+        if is_ollama_process "${exe_basename}"; then
+            if [[ "${force_kill}" == true ]]; then
+                echo "  ${YELLOW}WARNING${RESET}: Force-killing Ollama process PID ${target_pid}."
+            else
+                echo "  ${YELLOW}PROTECTED${RESET}: PID ${target_pid} (${exe_basename}) is an Ollama process managed by systemd."
+                echo "  Use 'tuku kill --force ${target_pid}' to kill anyway."
+                skipped=$((skipped + 1))
+                continue
+            fi
+        fi
+
+        # Verify the process is actually using the GPU
+        local is_gpu_process=false
+        local gpu_procs_check
+        gpu_procs_check="$(get_gpu_processes)"
+        if [[ -n "${gpu_procs_check}" ]]; then
+            if echo "${gpu_procs_check}" | awk '{print $1}' | grep -q "^${target_pid}$"; then
+                is_gpu_process=true
+            fi
+        fi
+
+        if [[ "${is_gpu_process}" == false ]]; then
+            echo "  ${YELLOW}SKIP${RESET}: PID ${target_pid} (${exe_basename}) is not using the GPU (skipping)."
+            skipped=$((skipped + 1))
             continue
         fi
 
@@ -1906,7 +2258,7 @@ usage() {
     cat <<'EOF'
 Usage: tuku [COMMAND] [OPTIONS]
 
-GPU process management for shared servers running llama.cpp.
+GPU process management for shared servers.
 
 Commands:
   (default)    Show GPU status dashboard
@@ -1914,7 +2266,8 @@ Commands:
   list         Show all llama.cpp processes with diagnostic info
   install      Set up automatic reaping via cron
   uninstall    Remove the cron job
-  kill <PID>   Manually kill a llama.cpp process
+  kill <PID>   Manually kill a GPU process
+  gpu          Show all processes using the GPU
 
 Dashboard Options:
   --json       Output as JSON
@@ -1925,6 +2278,9 @@ Reap Options:
   --json       Output as JSON
 
 List Options:
+  --json       Output as JSON
+
+Gpu Options:
   --json       Output as JSON
 
 Run 'tuku <command> --help' for command-specific options.
@@ -1939,6 +2295,7 @@ main() {
         install)   shift; cmd_install "$@" ;;
         uninstall) shift; cmd_uninstall "$@" ;;
         kill)      shift; cmd_kill "$@" ;;
+        gpu)       shift; cmd_gpu "$@" ;;
         --help|-h) usage ;;
         --version) echo "tuku ${VERSION}"; exit 0 ;;
         --json|--compact|--no-color)
